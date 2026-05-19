@@ -51,19 +51,23 @@ and authenticated Claude Code CLI.
 
 ### Homebrew
 
-After the project is published, each GitHub release attaches a generated
-Homebrew formula:
+Install from the official tap:
 
 ```sh
-brew install https://github.com/Pyiner/cctty/releases/latest/download/cctty.rb
+brew install Pyiner/cctty/cctty
 ```
 
-For tap-based installs, copy the generated `cctty.rb` release asset into
-`Pyiner/homebrew-tap` as `Formula/cctty.rb`, then users can install with:
+or tap once and install normally:
 
 ```sh
-brew install Pyiner/tap/cctty
+brew tap Pyiner/cctty
+brew install cctty
 ```
+
+The tap lives at
+[`Pyiner/homebrew-cctty`](https://github.com/Pyiner/homebrew-cctty). Each
+tagged release also attaches the generated formula as `cctty.rb` for auditing
+and manual tap updates.
 
 ### Release Binary
 
@@ -331,7 +335,10 @@ git push origin v0.1.0
 ```
 
 The release workflow builds macOS and Linux archives, publishes SHA-256 sums,
-and attaches a generated Homebrew formula as `cctty.rb`.
+and attaches a generated Homebrew formula as `cctty.rb`. If the repository
+secret `HOMEBREW_TAP_TOKEN` is configured with write access to
+`Pyiner/homebrew-cctty`, the same workflow also updates
+`Formula/cctty.rb` in the tap.
 
 ## Compatibility Matrix
 
