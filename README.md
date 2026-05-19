@@ -334,9 +334,9 @@ git push origin v0.1.0
 
 The release workflow builds macOS and Linux archives and publishes SHA-256
 sums. If the repository secret `HOMEBREW_TAP_TOKEN` is configured with write
-access to `Pyiner/homebrew-cctty`, the same workflow also updates
-`Formula/cctty.rb` in the tap. The formula is not published as a release asset;
-users should install through the tap.
+access to `Pyiner/homebrew-cctty`, the same workflow also updates the Homebrew
+tap. The formula is not published as a release asset; users should install
+through the tap.
 
 ## Compatibility Matrix
 
