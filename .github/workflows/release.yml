@@ -80,6 +80,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate Homebrew formula
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         run: |
           bash scripts/generate-homebrew-formula.sh "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" dist > dist/cctty.rb
 
@@ -91,13 +92,11 @@ jobs:
             gh release upload "${GITHUB_REF_NAME}" \
               dist/*.tar.gz \
               dist/*.sha256 \
-              dist/cctty.rb \
               --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
               dist/*.tar.gz \
               dist/*.sha256 \
-              dist/cctty.rb \
               --title "cctty ${GITHUB_REF_NAME}" \
               --generate-notes
           fi

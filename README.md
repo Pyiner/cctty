@@ -65,9 +65,7 @@ brew install cctty
 ```
 
 The tap lives at
-[`Pyiner/homebrew-cctty`](https://github.com/Pyiner/homebrew-cctty). Each
-tagged release also attaches the generated formula as `cctty.rb` for auditing
-and manual tap updates.
+[`Pyiner/homebrew-cctty`](https://github.com/Pyiner/homebrew-cctty).
 
 ### Release Binary
 
@@ -334,11 +332,11 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds macOS and Linux archives, publishes SHA-256 sums,
-and attaches a generated Homebrew formula as `cctty.rb`. If the repository
-secret `HOMEBREW_TAP_TOKEN` is configured with write access to
-`Pyiner/homebrew-cctty`, the same workflow also updates
-`Formula/cctty.rb` in the tap.
+The release workflow builds macOS and Linux archives and publishes SHA-256
+sums. If the repository secret `HOMEBREW_TAP_TOKEN` is configured with write
+access to `Pyiner/homebrew-cctty`, the same workflow also updates
+`Formula/cctty.rb` in the tap. The formula is not published as a release asset;
+users should install through the tap.
 
 ## Compatibility Matrix
 
