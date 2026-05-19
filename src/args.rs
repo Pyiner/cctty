@@ -283,7 +283,7 @@ fn flag_arity(arg: &str) -> FlagArity {
         | "--task-budget"
         | "--thinking"
         | "--thinking-display" => FlagArity::One,
-        "--debug" | "-d" | "--from-pr" | "--remote-control" | "--tmux" | "--worktree" | "-w" => {
+        "--debug" | "-d" | "--from-pr" | "--remote-control" | "--worktree" | "-w" => {
             FlagArity::Optional
         }
         _ => FlagArity::None,
@@ -345,5 +345,232 @@ mod tests {
             invocation.passthrough_args,
             vec!["--setting-sources=project".to_owned()]
         );
+    }
+
+    #[test]
+    fn parse_tmux_does_not_swallow_prompt() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--print".to_owned(),
+            "--tmux".to_owned(),
+            "hello".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(invocation.prompt.as_deref(), Some("hello"));
+        assert!(
+            invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg == "--tmux")
+        );
+    }
+
+    #[test]
+    fn parse_passes_every_current_claude_help_option_shape() {
+        for case in current_claude_option_cases() {
+            let mut argv = vec![
+                "cctty".to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+            ];
+            argv.extend(case.argv.iter().map(|value| value.to_string()));
+            argv.push("--input-format".to_owned());
+            argv.push("stream-json".to_owned());
+
+            let invocation = Invocation::parse(argv)
+                .unwrap_or_else(|error| panic!("{} failed to parse: {error}", case.name));
+            if matches!(case.name, "-h" | "--help" | "-v" | "--version") {
+                assert_eq!(invocation.mode, CommandMode::Passthrough);
+                for expected in case.expected_passthrough {
+                    assert!(
+                        invocation
+                            .passthrough_args
+                            .iter()
+                            .any(|arg| arg == expected),
+                        "{} did not pass through {expected:?}; got {:?}",
+                        case.name,
+                        invocation.passthrough_args
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                invocation.input_format,
+                InputFormat::StreamJson,
+                "{} swallowed --input-format",
+                case.name
+            );
+            for expected in case.expected_passthrough {
+                assert!(
+                    invocation
+                        .passthrough_args
+                        .iter()
+                        .any(|arg| arg == expected),
+                    "{} did not pass through {expected:?}; got {:?}",
+                    case.name,
+                    invocation.passthrough_args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_passes_all_permission_modes() {
+        for mode in [
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "default",
+            "dontAsk",
+            "plan",
+        ] {
+            let invocation = Invocation::parse(vec![
+                "cctty".to_owned(),
+                "--print".to_owned(),
+                "--permission-mode".to_owned(),
+                mode.to_owned(),
+                "hello".to_owned(),
+            ])
+            .unwrap();
+
+            assert!(
+                invocation
+                    .passthrough_args
+                    .windows(2)
+                    .any(|pair| pair == ["--permission-mode", mode]),
+                "permission mode {mode} was not passed through"
+            );
+        }
+    }
+
+    struct OptionCase {
+        name: &'static str,
+        argv: &'static [&'static str],
+        expected_passthrough: &'static [&'static str],
+    }
+
+    fn current_claude_option_cases() -> Vec<OptionCase> {
+        vec![
+            pass("--add-dir", &["--add-dir", "dir-a", "dir-b"]),
+            pass("--agent", &["--agent", "reviewer"]),
+            pass(
+                "--agents",
+                &[
+                    "--agents",
+                    r#"{"reviewer":{"description":"Review","prompt":"Review"}}"#,
+                ],
+            ),
+            pass(
+                "--allow-dangerously-skip-permissions",
+                &["--allow-dangerously-skip-permissions"],
+            ),
+            pass("--allowedTools", &["--allowedTools", "Bash,Read"]),
+            pass("--allowed-tools", &["--allowed-tools", "Bash", "Read"]),
+            pass(
+                "--append-system-prompt",
+                &["--append-system-prompt", "extra"],
+            ),
+            pass("--bare", &["--bare"]),
+            pass("--betas", &["--betas", "beta-a", "beta-b"]),
+            pass("--brief", &["--brief"]),
+            pass("--chrome", &["--chrome"]),
+            pass("-c", &["-c"]),
+            pass("--continue", &["--continue"]),
+            pass(
+                "--dangerously-skip-permissions",
+                &["--dangerously-skip-permissions"],
+            ),
+            pass("-d", &["-d", "api"]),
+            pass("--debug", &["--debug", "api"]),
+            pass("--debug-file", &["--debug-file", "debug.log"]),
+            pass("--disable-slash-commands", &["--disable-slash-commands"]),
+            pass("--disallowedTools", &["--disallowedTools", "Write,Edit"]),
+            pass(
+                "--disallowed-tools",
+                &["--disallowed-tools", "Write", "Edit"],
+            ),
+            pass("--effort", &["--effort", "low"]),
+            pass(
+                "--exclude-dynamic-system-prompt-sections",
+                &["--exclude-dynamic-system-prompt-sections"],
+            ),
+            pass("--fallback-model", &["--fallback-model", "sonnet"]),
+            pass(
+                "--file",
+                &["--file", "file_abc:doc.txt", "file_def:img.png"],
+            ),
+            pass("--fork-session", &["--fork-session"]),
+            pass("--from-pr", &["--from-pr", "123"]),
+            pass("-h", &["-h"]),
+            pass("--help", &["--help"]),
+            pass("--ide", &["--ide"]),
+            pass("--include-hook-events", &["--include-hook-events"]),
+            consumed(
+                "--include-partial-messages",
+                &["--include-partial-messages"],
+            ),
+            consumed("--input-format", &["--input-format", "text"]),
+            pass("--json-schema", &["--json-schema", r#"{"type":"object"}"#]),
+            pass("--max-budget-usd", &["--max-budget-usd", "0.01"]),
+            pass("--mcp-config", &["--mcp-config", r#"{"mcpServers":{}}"#]),
+            pass("--mcp-debug", &["--mcp-debug"]),
+            pass("--model", &["--model", "sonnet"]),
+            pass("-n", &["-n", "Synthetic Session"]),
+            pass("--name", &["--name", "Synthetic Session"]),
+            pass("--no-chrome", &["--no-chrome"]),
+            consumed("--no-session-persistence", &["--no-session-persistence"]),
+            consumed("--output-format", &["--output-format", "json"]),
+            pass("--permission-mode", &["--permission-mode", "plan"]),
+            pass("--plugin-dir", &["--plugin-dir", "plugin-dir"]),
+            pass(
+                "--plugin-url",
+                &["--plugin-url", "https://example.invalid/plugin.zip"],
+            ),
+            consumed("-p", &["-p"]),
+            consumed("--print", &["--print"]),
+            pass("--remote-control", &["--remote-control", "synthetic"]),
+            pass(
+                "--remote-control-session-name-prefix",
+                &["--remote-control-session-name-prefix", "synthetic"],
+            ),
+            consumed("--replay-user-messages", &["--replay-user-messages"]),
+            pass("-r", &["-r", "00000000-0000-0000-0000-000000000001"]),
+            pass(
+                "--resume",
+                &["--resume", "00000000-0000-0000-0000-000000000001"],
+            ),
+            pass(
+                "--session-id",
+                &["--session-id", "00000000-0000-0000-0000-000000000002"],
+            ),
+            pass("--setting-sources", &["--setting-sources", "project"]),
+            pass("--settings", &["--settings", "{}"]),
+            pass("--strict-mcp-config", &["--strict-mcp-config"]),
+            pass("--system-prompt", &["--system-prompt", "system"]),
+            pass("--tmux", &["--tmux"]),
+            pass("--tools", &["--tools", "Bash,Read"]),
+            pass("--verbose", &["--verbose"]),
+            pass("-v", &["-v"]),
+            pass("--version", &["--version"]),
+            pass("-w", &["-w", "synthetic-worktree"]),
+            pass("--worktree", &["--worktree", "synthetic-worktree"]),
+        ]
+    }
+
+    fn pass(name: &'static str, argv: &'static [&'static str]) -> OptionCase {
+        OptionCase {
+            name,
+            argv,
+            expected_passthrough: argv,
+        }
+    }
+
+    fn consumed(name: &'static str, argv: &'static [&'static str]) -> OptionCase {
+        OptionCase {
+            name,
+            argv,
+            expected_passthrough: &[],
+        }
     }
 }

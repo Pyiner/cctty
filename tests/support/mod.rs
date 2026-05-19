@@ -30,6 +30,10 @@ import os
 from pathlib import Path
 import sys
 
+argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
+if argv_path:
+    Path(argv_path).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+
 if "--version" in sys.argv or "-v" in sys.argv:
     print("fake claude 0.0.0")
     sys.exit(0)
