@@ -15,6 +15,7 @@ pub struct PtySpawnSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
+    pub unset_env: Vec<String>,
 }
 
 pub struct PtyProcess {
@@ -87,6 +88,14 @@ fn spawn_unix_pty(spec: &PtySpawnSpec) -> Result<PtyProcess> {
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let unset_env = spec
+        .unset_env
+        .iter()
+        .map(|key| {
+            CString::new(key.as_str())
+                .map_err(|_| CcttyError::Tty("environment key contains NUL byte".to_owned()))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut master_fd: libc::c_int = -1;
     let mut winsize = libc::winsize {
@@ -114,6 +123,9 @@ fn spawn_unix_pty(spec: &PtySpawnSpec) -> Result<PtyProcess> {
         unsafe {
             libc::chdir(cwd.as_ptr());
             libc::unsetenv(c"CLAUDECODE".as_ptr());
+            for key in &unset_env {
+                libc::unsetenv(key.as_ptr());
+            }
             for (key, value) in &env {
                 libc::setenv(key.as_ptr(), value.as_ptr(), 1);
             }

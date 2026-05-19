@@ -81,6 +81,16 @@ responses against the real interactive Claude TTY:
 CCTTY_LIVE_PERMISSION=1 cargo test --test claude_differential live_permission_prompt_stdio_honors_project_ask_rules -- --ignored --nocapture
 ```
 
+Live SDK game tests install the official Python and TypeScript SDKs, run them
+against real `cctty`/Claude, keep `permissionMode` at `default`, approve file
+edits through SDK `can_use_tool` callbacks, and verify that a small browser game
+is actually written:
+
+```sh
+CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_python_sdk_builds_game_with_cctty_permissions -- --ignored --nocapture
+CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_typescript_sdk_builds_game_with_cctty_permissions -- --ignored --nocapture
+```
+
 ## Compatibility Matrix
 
 Captured from `claude --help` on Claude Code `2.1.144`.
@@ -123,7 +133,7 @@ Status legend:
 | `--ide` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--include-hook-events` | Partial | Forwarded. Hook events appear only if interactive transcript writes them; stream semantics are not guaranteed to match `--print`. | Parser coverage only. |
 | `--include-partial-messages` | Unsupported | Consumed by `cctty`; no partial assistant chunks are emitted because transcript tailing only sees persisted messages. | Parser coverage marks it consumed. |
-| `--input-format` | Supported | `text` prompts are read from argv/stdin. `stream-json` SDK input is read from stdin. | Fake-PTY test, Python SDK test, TypeScript SDK test. |
+| `--input-format` | Supported | `text` prompts are read from argv/stdin. `stream-json` SDK input is read from stdin. | Fake-PTY test, Python SDK test, TypeScript SDK test, plus live Python/TypeScript SDK game tests. |
 | `--json-schema` | Partial | Forwarded, but `cctty` synthesizes result frames when interactive transcript lacks one; `structured_output` parity is not proven. | Parser coverage only. Needs structured-output differential. |
 | `--max-budget-usd` | Partial | Forwarded, but Claude documents this as print-only. Underlying interactive behavior is not proven equivalent. | Parser coverage only. |
 | `--mcp-config` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. SDK MCP control messages are not bridged yet. |
@@ -133,7 +143,7 @@ Status legend:
 | `--no-chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--no-session-persistence` | Supported | Consumed by `cctty`. The underlying interactive run uses the normal Claude config/auth, then `cctty` removes the generated transcript and empty project directories after the run. | Parser coverage plus fake-PTY persistence cleanup test. This preserves auth better than replacing `CLAUDE_CONFIG_DIR`. |
 | `--output-format` | Partial | `text`, `json`, and `stream-json` are emitted by `cctty`. `stream-json` includes transcript frames plus a synthetic `result` frame if interactive Claude did not write one. | Fake-PTY and live stream-json differential pass. Result metadata is partial. |
-| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions`; live permission coverage also exercises `default` with a project-local `permissions.ask` rule. Other modes still need focused live tests. |
+| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions`; live permission coverage exercises `default` with project-local `permissions.ask` rules for Bash and file writes through Python/TypeScript SDK callbacks. Other modes still need focused live tests. |
 | `--plugin-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--plugin-url` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `-p`, `--print` | Supported | Consumed by `cctty`; underlying Claude is intentionally launched interactively through a PTY. | Fake-PTY and live differential pass for basic query. |
@@ -145,7 +155,7 @@ Status legend:
 | `--setting-sources` | Pass-through | Forwarded to interactive Claude. | Parser coverage, including `--setting-sources=project`. |
 | `--settings` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--strict-mcp-config` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
-| `--system-prompt` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--system-prompt` | Pass-through | Non-empty values are forwarded to interactive Claude. Empty or whitespace-only SDK values are consumed so they do not erase Claude Code's built-in interactive system prompt. | Parser coverage for non-empty pass-through and empty-value consumption. |
 | `--tmux` | Pass-through | Forwarded. `--tmux=classic` is preserved as an equals-form flag; plain `--tmux` does not swallow the prompt. | Parser regression test. |
 | `--tools` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--verbose` | Pass-through | Forwarded. `cctty` itself does not require it for stream-json, but real Claude does, so SDK callers usually include it. | Parser and live differential coverage. |
@@ -158,16 +168,17 @@ Some SDKs pass flags that are not listed in current `claude --help`.
 
 | Option(s) | Status | Current handling | Notes |
 | --- | --- | --- | --- |
-| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries and also recognizes real TTY permission forms when Claude has not persisted the transcript yet. It emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive permission UI by keyboard: allow confirms the selected approval row; deny selects menu item `2` and pastes the SDK denial message into Claude's follow-up form when present. If interactive Claude returns to the prompt after a rejected tool without writing a final result, `cctty` emits a synthetic error result with `result: "Permission denied"`. | Fake-PTY tests cover transcript-first allow/deny, TTY-form-before-transcript, and transcript-vs-TTY description precedence. Live Claude Code `2.1.144` coverage forces `Bash(printf:*)` approval with project-local settings and verifies both allow and deny. Still partial: non-Bash TTY forms, exact `permission_suggestions`, and exact `blocked_path` parity are not complete. |
+| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries and also recognizes real TTY permission forms when Claude has not persisted the transcript yet. It emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive permission UI by keyboard. Bash allow confirms the selected row; Bash deny selects menu item `2` and pastes the SDK denial message into Claude's follow-up form when present. File create/write/edit/update forms are mapped to `Write`/`Edit` with `file_path`; allow confirms the selected row, while deny selects the file prompt's `3. No` row to avoid accidentally choosing "allow all edits during this session". If interactive Claude returns to the prompt after a rejected tool without writing a final result, `cctty` emits a synthetic error result with `result: "Permission denied"`. | Fake-PTY tests cover transcript-first allow/deny, Bash TTY-form-before-transcript, file Write TTY-form-before-transcript, and transcript-vs-TTY description precedence. Live Claude Code `2.1.144` coverage forces `Bash(printf:*)` approval with project-local settings and verifies both allow and deny. Live Python and TypeScript SDK game tests exercise `Write` approval through real file-creation TTY forms. Still partial: broader `Edit`/`MultiEdit` TTY variants, exact `permission_suggestions`, and exact `blocked_path` parity are not complete. |
 | `--permission-prompt-tool <name>` | Pass-through | Non-`stdio` values are forwarded to interactive Claude. `cctty` does not emulate custom permission prompt tools itself. | Parser coverage only. |
 | `--system-prompt-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage because SDKs/older CLIs may emit it. |
 | `--task-budget`, `--max-thinking-tokens`, `--thinking`, `--thinking-display`, `--managed-settings`, `--resume-session-at` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. These are SDK/newer-CLI compatibility entries, not from the captured help output above. |
 
 ### Current High-Risk Gaps
 
-- Permission callbacks now have fake-PTY allow/deny coverage and a live
-  `Bash(printf:*)` approval differential for both allow and deny. Remaining
-  risk is breadth: non-Bash permission forms, `allowedTools`/`disallowedTools`
+- Permission callbacks now have fake-PTY allow/deny coverage, a live
+  `Bash(printf:*)` approval differential for both allow and deny, and live
+  Python/TypeScript SDK coverage for file creation approvals. Remaining risk is
+  breadth: more `Edit`/`MultiEdit` TTY variants, `allowedTools`/`disallowedTools`
   interactions, and exact SDK metadata fields still need live coverage.
 - `--include-partial-messages` is not implemented because transcript tailing does
   not expose partial assistant chunks.

@@ -120,6 +120,22 @@ impl Invocation {
                 index += 2;
                 continue;
             }
+            if let Some(value) = long_equals_value(&arg, "--system-prompt") {
+                if !value.trim().is_empty() {
+                    passthrough_args.push(arg);
+                }
+                index += 1;
+                continue;
+            }
+            if arg == "--system-prompt" {
+                let value = take_value(&args, index, "--system-prompt")?.to_owned();
+                if !value.trim().is_empty() {
+                    passthrough_args.push(arg);
+                    passthrough_args.push(value);
+                }
+                index += 2;
+                continue;
+            }
 
             if let Some(value) = long_equals_value(&arg, "--session-id") {
                 session_id = Some(value.to_owned());
@@ -509,6 +525,44 @@ mod tests {
                 .passthrough_args
                 .windows(2)
                 .any(|arg| arg == ["--permission-prompt-tool", "custom-permission-tool"])
+        );
+    }
+
+    #[test]
+    fn parse_drops_empty_sdk_system_prompt_to_preserve_claude_defaults() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--input-format".to_owned(),
+            "stream-json".to_owned(),
+            "--output-format".to_owned(),
+            "stream-json".to_owned(),
+            "--system-prompt".to_owned(),
+            "".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(
+            !invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg == "--system-prompt")
+        );
+
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--input-format".to_owned(),
+            "stream-json".to_owned(),
+            "--output-format".to_owned(),
+            "stream-json".to_owned(),
+            "--system-prompt=   ".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(
+            !invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg.starts_with("--system-prompt"))
         );
     }
 

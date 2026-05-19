@@ -72,6 +72,37 @@ fn stream_json_text_prompt_uses_tty_transcript() {
 }
 
 #[test]
+fn interactive_claude_gets_terminal_env_not_sdk_transport_env() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let env_path = tempfile::NamedTempFile::new().unwrap();
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ENV_PATH", env_path.path())
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-py")
+        .env("CLAUDE_AGENT_SDK_VERSION", "0.0.0")
+        .env("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+        .current_dir(workspace.path())
+        .args(["--print", "--output-format", "stream-json", "Say OK"])
+        .assert()
+        .success();
+
+    let env: Value =
+        serde_json::from_str(&std::fs::read_to_string(env_path.path()).unwrap()).unwrap();
+    assert_eq!(env["TERM"], "xterm-256color");
+    assert_eq!(env["COLORTERM"], "truecolor");
+    assert_eq!(env["NO_COLOR"], Value::Null);
+    assert_eq!(env["CLAUDE_CODE_ENTRYPOINT"], Value::Null);
+    assert_eq!(env["CLAUDE_AGENT_SDK_VERSION"], Value::Null);
+}
+
+#[test]
 fn passes_all_permission_modes_to_underlying_claude_tty() {
     for mode in [
         "acceptEdits",
@@ -458,6 +489,108 @@ fn stream_json_permission_prompt_stdio_reads_tty_form_before_transcript_tool_use
         "expected exactly one can_use_tool control_request"
     );
     assert!(saw_allowed_result, "expected allowed fake TTY tool result");
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_permission_prompt_stdio_reads_tty_write_form_before_transcript_tool_use() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000007";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_TTY_WRITE_FAKE_TOOL"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut permission_request_count = 0;
+    let mut saw_denied_result = false;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                permission_request_count += 1;
+                assert_eq!(
+                    value["request"]["subtype"],
+                    Value::String("can_use_tool".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["tool_name"],
+                    Value::String("Write".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["input"]["file_path"],
+                    Value::String("index.html".to_owned())
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "deny"
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                saw_denied_result = value["result"] == "FAKE_TTY_WRITE_DENIED";
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        permission_request_count, 1,
+        "expected exactly one can_use_tool control_request"
+    );
+    assert!(
+        saw_denied_result,
+        "expected cctty to select the file prompt's third No choice"
+    );
     let status = child
         .wait_timeout(Duration::from_secs(5))
         .unwrap()
