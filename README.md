@@ -1,24 +1,106 @@
 # cctty
 
-`cctty` is a Claude CLI replacement for non-interactive SDK usage.
+**A drop-in Claude Agent SDK runner backed by the interactive Claude TTY.**
 
-The goal is drop-in compatibility, but this repository does not claim full
-Claude CLI parity yet. The table below is the compatibility contract for the
-current implementation.
+`cctty` lets existing Python and TypeScript Claude Agent SDK apps keep using the
+normal SDK protocol while the actual work is performed by the interactive
+`claude` CLI running inside a PTY. If the non-interactive Claude Code execution
+path changes pricing, behavior, or availability, point your SDK at `cctty` and
+keep the rest of your agent code intact.
 
-Normal interactive commands, `--help`, and `--version` are proxied to the real
-`claude` binary. The `--print` / `--input-format stream-json` path is handled by
-starting interactive Claude in a PTY, submitting prompts with bracketed paste,
-tailing Claude's JSONL transcript, and emitting `text`, `json`, or
-`stream-json` output.
+What changes in your app?
 
-This keeps native Claude Agent SDK callers on their normal subprocess protocol
-while avoiding direct use of Claude's non-interactive execution path.
+One executable path:
 
-## Usage
+```diff
+- cli_path="/path/to/claude"
++ cli_path="/path/to/cctty"
+```
+
+or, in TypeScript:
+
+```diff
+- pathToClaudeCodeExecutable: "/path/to/claude"
++ pathToClaudeCodeExecutable: "/path/to/cctty"
+```
+
+Everything else stays on the official SDK: streaming messages, permission
+callbacks, `permissionMode`, `maxTurns`, `model`, `settingSources`, and the rest
+of the SDK surface continue to flow through the SDK you already use.
+
+`cctty` is not affiliated with Anthropic. It still requires a locally installed
+and authenticated Claude Code CLI.
+
+## Why cctty?
+
+- **Keep official SDKs.** Use `claude-agent-sdk` for Python or
+  `@anthropic-ai/claude-agent-sdk` for TypeScript. `cctty` replaces only the
+  CLI executable the SDK launches.
+- **Avoid the non-interactive execution path.** `cctty` drives interactive
+  Claude through a real TTY, submits prompts with bracketed paste, tails
+  Claude's transcript, and emits SDK-compatible `stream-json`.
+- **Preserve permission callbacks.** SDK `can_use_tool` approvals are bridged to
+  Claude's keyboard-driven TTY permission forms for Bash and file writes.
+- **Tested against real SDKs.** The live suite asks both Python and TypeScript
+  SDKs to build a browser mini-game under `permissionMode: "default"` and
+  verifies the files are created through SDK approvals.
+- **Transparent compatibility contract.** Every captured `claude --help` flag is
+  listed below with support status and known gaps.
+
+## Install
+
+### Homebrew
+
+After the project is published, each GitHub release attaches a generated
+Homebrew formula:
 
 ```sh
-cctty --print --output-format stream-json "Reply OK"
+brew install https://github.com/Pyiner/cctty/releases/latest/download/cctty.rb
+```
+
+For tap-based installs, copy the generated `cctty.rb` release asset into
+`Pyiner/homebrew-tap` as `Formula/cctty.rb`, then users can install with:
+
+```sh
+brew install Pyiner/tap/cctty
+```
+
+### Release Binary
+
+Download the archive for your platform from GitHub Releases:
+
+```sh
+curl -L -o cctty.tar.gz \
+  https://github.com/Pyiner/cctty/releases/download/v0.1.0/cctty-0.1.0-aarch64-apple-darwin.tar.gz
+tar -xzf cctty.tar.gz
+sudo install -m 0755 cctty /usr/local/bin/cctty
+```
+
+Published release targets:
+
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `x86_64-unknown-linux-gnu`
+
+### From Source
+
+```sh
+cargo install --git https://github.com/Pyiner/cctty
+```
+
+## Quick Start
+
+First confirm the underlying Claude CLI is installed and authenticated:
+
+```sh
+claude --version
+cctty --version
+```
+
+Run a direct CLI smoke test:
+
+```sh
+cctty --print --output-format stream-json "Reply exactly CCTTY_OK"
 ```
 
 By default `cctty` finds `claude` on `PATH`. To point at a specific underlying
@@ -28,28 +110,176 @@ Claude binary:
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
 
-TypeScript SDK:
+## TypeScript SDK
+
+Install the official SDK:
+
+```sh
+npm install @anthropic-ai/claude-agent-sdk
+```
+
+Use `cctty` as the SDK executable:
 
 ```ts
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 for await (const message of query({
-  prompt: "Reply OK",
-  options: { pathToClaudeCodeExecutable: "/path/to/cctty" },
+  prompt: "Create a tiny README for this project.",
+  options: {
+    pathToClaudeCodeExecutable: "cctty",
+    permissionMode: "default",
+    settingSources: ["project", "local"],
+  },
 })) {
   console.log(message);
 }
 ```
 
-Python SDK:
+With a permission callback:
+
+```ts
+import { query } from "@anthropic-ai/claude-agent-sdk";
+
+const canUseTool = async (toolName: string, input: Record<string, unknown>) => {
+  if (["Read", "Write", "Edit", "MultiEdit"].includes(toolName)) {
+    return { behavior: "allow" as const };
+  }
+
+  if (toolName === "Bash") {
+    const command = String(input.command ?? "");
+    if (command === "pwd" || command.startsWith("ls ")) {
+      return { behavior: "allow" as const };
+    }
+  }
+
+  return {
+    behavior: "deny" as const,
+    message: `${toolName} is not allowed by this app`,
+  };
+};
+
+async function* prompt() {
+  yield {
+    type: "user" as const,
+    message: {
+      role: "user" as const,
+      content: "Write index.html for a tiny canvas game.",
+    },
+  };
+}
+
+for await (const message of query({
+  prompt: prompt(),
+  options: {
+    pathToClaudeCodeExecutable: "cctty",
+    permissionMode: "default",
+    canUseTool,
+    settingSources: ["project", "local"],
+  },
+})) {
+  console.log(message);
+}
+```
+
+## Python SDK
+
+Install the official SDK:
+
+```sh
+pip install claude-agent-sdk
+```
+
+Use `cctty` as the SDK executable:
 
 ```py
+import asyncio
+from pathlib import Path
+
 from claude_agent_sdk import ClaudeAgentOptions, query
 
-options = ClaudeAgentOptions(cli_path="/path/to/cctty")
-async for message in query(prompt="Reply OK", options=options):
-    print(message)
+
+async def main():
+    options = ClaudeAgentOptions(
+        cli_path="cctty",
+        cwd=Path.cwd(),
+        permission_mode="default",
+        setting_sources=["project", "local"],
+    )
+
+    async for message in query(
+        prompt="Create a tiny README for this project.",
+        options=options,
+    ):
+        print(message)
+
+
+asyncio.run(main())
 ```
+
+With a permission callback:
+
+```py
+import asyncio
+from pathlib import Path
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    query,
+)
+
+
+async def can_use_tool(tool_name, input, context):
+    if tool_name in {"Read", "Write", "Edit", "MultiEdit"}:
+        return PermissionResultAllow()
+
+    if tool_name == "Bash":
+        command = str(input.get("command", ""))
+        if command == "pwd" or command.startswith("ls "):
+            return PermissionResultAllow()
+
+    return PermissionResultDeny(message=f"{tool_name} is not allowed by this app")
+
+
+async def prompt():
+    yield {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": "Write index.html for a tiny canvas game.",
+        },
+    }
+
+
+async def main():
+    options = ClaudeAgentOptions(
+        cli_path="cctty",
+        cwd=Path.cwd(),
+        permission_mode="default",
+        can_use_tool=can_use_tool,
+        setting_sources=["project", "local"],
+    )
+
+    async for message in query(prompt=prompt(), options=options):
+        print(message)
+
+
+asyncio.run(main())
+```
+
+## How It Works
+
+Normal interactive commands, `--help`, and `--version` are proxied to the real
+`claude` binary. The `--print` / `--input-format stream-json` path is handled by
+starting interactive Claude in a PTY, submitting prompts with bracketed paste,
+tailing Claude's JSONL transcript, and emitting `text`, `json`, or
+`stream-json` output.
+
+For SDK permission callbacks, `cctty` consumes the hidden
+`--permission-prompt-tool stdio` flag, emits SDK-style `can_use_tool`
+`control_request` messages, waits for SDK `control_response` decisions, and then
+drives Claude's interactive permission UI with keyboard input.
 
 ## Tests
 
@@ -90,6 +320,18 @@ is actually written:
 CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_python_sdk_builds_game_with_cctty_permissions -- --ignored --nocapture
 CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_typescript_sdk_builds_game_with_cctty_permissions -- --ignored --nocapture
 ```
+
+## Release Flow
+
+The repository includes GitHub Actions for CI and tagged releases.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds macOS and Linux archives, publishes SHA-256 sums,
+and attaches a generated Homebrew formula as `cctty.rb`.
 
 ## Compatibility Matrix
 

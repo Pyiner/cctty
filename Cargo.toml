@@ -2,6 +2,12 @@
 name = "cctty"
 version = "0.1.0"
 edition = "2024"
+description = "Drop-in Claude Agent SDK runner backed by the interactive Claude TTY"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Pyiner/cctty"
+keywords = ["claude", "agent-sdk", "tty", "cli", "automation"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 libc = "0.2"
