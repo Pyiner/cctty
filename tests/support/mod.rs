@@ -35,6 +35,18 @@ argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
 if argv_path:
     Path(argv_path).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
 
+env_path = os.environ.get("FAKE_CLAUDE_ENV_PATH")
+if env_path:
+    keys = [
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK",
+    ]
+    Path(env_path).write_text(json.dumps({key: os.environ.get(key) for key in keys}), encoding="utf-8")
+
 if "--version" in sys.argv or "-v" in sys.argv:
     print("fake claude 0.0.0")
     sys.exit(0)
@@ -102,6 +114,34 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-tty-1","name":"Bash","input":{"command":"echo tty fake"}}]}}) + "\n")
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-tty-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
+    if "USE_TTY_WRITE_FAKE_TOOL" in prompt:
+        sys.stdout.write("Do you want to create index.html ?\n")
+        sys.stdout.write("❯ 1. Yes\n")
+        sys.stdout.write("  2. Yes, allow all edits during this session (shift+tab)\n")
+        sys.stdout.write("  3. No\n")
+        sys.stdout.write("Esc to cancel · Tab to amend\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        if b"3" in ack or ack.startswith(b"\x1b"):
+            response = "FAKE_TTY_WRITE_DENIED"
+        elif b"2" in ack:
+            response = "FAKE_TTY_WRITE_SESSION_ALLOWED"
+        else:
+            response = "FAKE_TTY_WRITE_ALLOWED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-write-1","name":"Write","input":{"file_path":"index.html","content":"<canvas></canvas>"}}]}}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-write-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
         sys.stdout.write("Context permissions /mcp\n")

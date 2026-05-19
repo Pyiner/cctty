@@ -57,13 +57,14 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             .as_ref()
             .map(|session_id| transcript_path(&config_dir, &cwd, session_id))
     };
-    let env = HashMap::new();
+    let env = interactive_claude_env();
 
     let mut process = PtyProcess::spawn(&PtySpawnSpec {
         command: claude,
         args: invocation.passthrough_args.clone(),
         cwd,
         env,
+        unset_env: interactive_claude_unset_env(),
     })?;
     prepare_tty_for_prompt(&mut process).await?;
 
@@ -93,6 +94,24 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         tail.remove_current_transcript()?;
     }
     Ok(0)
+}
+
+fn interactive_claude_env() -> HashMap<String, String> {
+    HashMap::from([
+        ("TERM".to_owned(), "xterm-256color".to_owned()),
+        ("COLORTERM".to_owned(), "truecolor".to_owned()),
+    ])
+}
+
+fn interactive_claude_unset_env() -> Vec<String> {
+    [
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_AGENT_SDK_VERSION",
+        "NO_COLOR",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 async fn run_stream_json(
@@ -566,6 +585,7 @@ struct ToolUse {
 struct ToolKey {
     name: String,
     command: Option<String>,
+    file_path: Option<String>,
     input: String,
 }
 
@@ -578,11 +598,22 @@ impl ToolKey {
                 .get("command")
                 .and_then(Value::as_str)
                 .map(normalize_tool_command),
+            file_path: tool_use
+                .input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(normalize_tool_path),
             input: serde_json::to_string(&tool_use.input).unwrap_or_default(),
         }
     }
 
     fn matches(&self, other: &Self) -> bool {
+        if is_file_tool(&self.name)
+            && is_file_tool(&other.name)
+            && let (Some(left), Some(right)) = (&self.file_path, &other.file_path)
+        {
+            return left == right;
+        }
         if self.name != other.name {
             return false;
         }
@@ -595,8 +626,16 @@ impl ToolKey {
     }
 }
 
+fn is_file_tool(name: &str) -> bool {
+    matches!(name, "Write" | "Edit" | "MultiEdit")
+}
+
 fn normalize_tool_command(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_tool_path(path: &str) -> String {
+    path.trim().replace('\\', "/")
 }
 
 fn commands_match(left: &str, right: &str) -> bool {
@@ -670,15 +709,15 @@ fn tool_uses_from_assistant(value: &Value) -> Vec<ToolUse> {
 
 fn tool_use_from_tty_permission_prompt(output: &str, tool_use_id: String) -> Option<ToolUse> {
     let plain_output = plain_tty_output(output);
-    if !plain_tty_output_has_permission_prompt(&plain_output) {
-        return None;
+    if plain_tty_output_has_permission_prompt(&plain_output) {
+        let command = bash_command_from_tty_permission_prompt(&output)?;
+        return Some(ToolUse {
+            id: tool_use_id,
+            name: "Bash".to_owned(),
+            input: json!({ "command": command }),
+        });
     }
-    let command = bash_command_from_tty_permission_prompt(&output)?;
-    Some(ToolUse {
-        id: tool_use_id,
-        name: "Bash".to_owned(),
-        input: json!({ "command": command }),
-    })
+    file_tool_use_from_tty_permission_prompt(&plain_output, tool_use_id)
 }
 
 fn bash_command_from_tty_permission_prompt(output: &str) -> Option<String> {
@@ -736,6 +775,54 @@ fn bash_parenthetical_command_from_tty_output(output: &str) -> Option<String> {
         let command = normalize_tool_command(command);
         if !command.is_empty() && !command.contains(":*") {
             return Some(command);
+        }
+    }
+    None
+}
+
+fn file_tool_use_from_tty_permission_prompt(output: &str, tool_use_id: String) -> Option<ToolUse> {
+    if !plain_tty_output_has_file_permission_prompt(output) {
+        return None;
+    }
+    let (name, file_path) = file_permission_tool_and_path(output)?;
+    Some(ToolUse {
+        id: tool_use_id,
+        name: name.to_owned(),
+        input: json!({ "file_path": file_path }),
+    })
+}
+
+fn file_permission_tool_and_path(output: &str) -> Option<(&'static str, String)> {
+    for (marker, tool_name) in [
+        ("Do you want to create ", "Write"),
+        ("Do you want to write ", "Write"),
+        ("Do you want to edit ", "Edit"),
+        ("Do you want to update ", "Edit"),
+    ] {
+        let Some((_, after)) = output.rsplit_once(marker) else {
+            continue;
+        };
+        let mut path = after;
+        for terminator in [
+            " ?",
+            "?",
+            " ❯",
+            " 1. Yes",
+            " Esc to cancel",
+            " Tab to amend",
+        ] {
+            if let Some((before, _)) = path.split_once(terminator) {
+                path = before;
+            }
+        }
+        let path = path
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"')
+            .trim()
+            .to_owned();
+        if !path.is_empty() {
+            return Some((tool_name, path));
         }
     }
     None
@@ -812,7 +899,10 @@ async fn apply_permission_decision(
     let saw_prompt = wait_for_tty_permission_prompt(process, tool_use).await;
     if denied {
         if saw_prompt {
-            process.write_all(b"2\r")?;
+            process.write_all(deny_selection_for_tty_permission_prompt(
+                &process.recent_output(),
+                tool_use,
+            ))?;
             if let Some(message) = permission_deny_message(control_response)
                 && wait_for_tty_permission_feedback_prompt(process).await
             {
@@ -825,6 +915,16 @@ async fn apply_permission_decision(
         process.write_all(b"\r")?;
     }
     Ok(denied)
+}
+
+fn deny_selection_for_tty_permission_prompt(output: &str, tool_use: &ToolUse) -> &'static [u8] {
+    let output = plain_tty_output(output);
+    if matches!(tool_use.name.as_str(), "Write" | "Edit" | "MultiEdit") && output.contains("3. No")
+    {
+        b"3\r"
+    } else {
+        b"2\r"
+    }
 }
 
 async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse) -> bool {
@@ -856,12 +956,43 @@ async fn wait_for_tty_permission_feedback_prompt(process: &PtyProcess) -> bool {
 
 fn tty_output_has_permission_prompt(output: &str, tool_use: &ToolUse) -> bool {
     let output = plain_tty_output(output);
-    let tool_name = tool_use.name.as_str();
-    plain_tty_output_has_permission_prompt_for_tool(&output, tool_name)
+    match tool_use.name.as_str() {
+        "Write" | "Edit" | "MultiEdit" => {
+            plain_tty_output_has_file_permission_prompt(&output)
+                && tool_use
+                    .input
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .is_none_or(|path| output.contains(path))
+        }
+        tool_name => plain_tty_output_has_permission_prompt_for_tool(&output, tool_name),
+    }
 }
 
 fn plain_tty_output_has_permission_prompt(output: &str) -> bool {
     plain_tty_output_has_permission_prompt_for_tool(output, "Bash")
+}
+
+fn plain_tty_output_has_file_permission_prompt(output: &str) -> bool {
+    let compact = compact_tty_output(output);
+    let asks_for_file_action = [
+        "Do you want to create ",
+        "Do you want to edit ",
+        "Do you want to update ",
+        "Do you want to write ",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker));
+    let has_allow_choice =
+        output.contains("1. Yes") || output.contains("Yes, allow") || compact.contains("1.Yes");
+    let has_deny_choice = output.contains("No") || compact.contains("No");
+    let has_controls = output.contains("Esc to cancel")
+        || output.contains("Tab to amend")
+        || output.contains("Do you want")
+        || compact.contains("Esctocancel")
+        || compact.contains("Tabtoamend")
+        || compact.contains("Doyouwant");
+    asks_for_file_action && has_allow_choice && has_deny_choice && has_controls
 }
 
 fn plain_tty_output_has_permission_prompt_for_tool(output: &str, tool_name: &str) -> bool {
@@ -1411,6 +1542,29 @@ mod tests {
         assert_eq!(
             tool_use.input["command"],
             Value::String("printf cctty-live-permission-allow".to_owned())
+        );
+    }
+
+    #[test]
+    fn parses_tty_write_permission_form_before_transcript_tool_use() {
+        let output = "\
+            Do you want to create index.html ?\r\n\
+            ❯ 1. Yes\r\n\
+              2. Yes, allow all edits during this session (shift+tab)\r\n\
+              3. No\r\n\
+            Esc to cancel · Tab to amend";
+        let tool_use = tool_use_from_tty_permission_prompt(output, "tool-write-1".to_owned())
+            .expect("file permission prompt should parse");
+
+        assert_eq!(tool_use.name, "Write");
+        assert_eq!(
+            tool_use.input["file_path"],
+            Value::String("index.html".to_owned())
+        );
+        assert!(tty_output_has_permission_prompt(output, &tool_use));
+        assert_eq!(
+            deny_selection_for_tty_permission_prompt(output, &tool_use),
+            b"3\r"
         );
     }
 
