@@ -123,9 +123,9 @@ Status legend:
 | `--model` | Pass-through | Forwarded to interactive Claude. | Parser coverage and live differential with default configured model path. Specific model aliases not exhaustively tested. |
 | `-n`, `--name` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--no-chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
-| `--no-session-persistence` | Unsupported | Consumed by `cctty`, but underlying interactive Claude still persists to its transcript store. | Parser coverage marks it consumed. Needs an explicit temp-store/delete strategy before claiming support. |
+| `--no-session-persistence` | Supported | Consumed by `cctty`. The underlying interactive run uses the normal Claude config/auth, then `cctty` removes the generated transcript and empty project directories after the run. | Parser coverage plus fake-PTY persistence cleanup test. This preserves auth better than replacing `CLAUDE_CONFIG_DIR`. |
 | `--output-format` | Partial | `text`, `json`, and `stream-json` are emitted by `cctty`. `stream-json` includes transcript frames plus a synthetic `result` frame if interactive Claude did not write one. | Fake-PTY and live stream-json differential pass. Result metadata is partial. |
-| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions` only. Permission prompts are not bridged into SDK callbacks yet. |
+| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions` only. |
 | `--plugin-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--plugin-url` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `-p`, `--print` | Supported | Consumed by `cctty`; underlying Claude is intentionally launched interactively through a PTY. | Fake-PTY and live differential pass for basic query. |
@@ -150,17 +150,17 @@ Some SDKs pass flags that are not listed in current `claude --help`.
 
 | Option(s) | Status | Current handling | Notes |
 | --- | --- | --- | --- |
-| `--permission-prompt-tool` | Unsupported for callbacks | Forwarded if supplied, but `cctty` does not yet bridge Claude TTY permission prompts to SDK `can_use_tool` callbacks. | This is the largest permission gap. SDK callers using `can_use_tool` should not rely on `cctty` yet. |
+| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries, emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive TTY permission UI by keyboard: allow confirms the selected approval row; deny selects the `No` row and pastes the SDK denial message into Claude's follow-up form when present. | Fake-PTY tests cover allow and deny keyboard flows and assert the flag is not forwarded. Live interactive observation on Claude Code `2.1.144` confirmed tool-use details are available in the transcript before the tool result; this developer machine auto-approved the safe Bash probe, so live denial-menu parity is still pending. |
+| `--permission-prompt-tool <name>` | Pass-through | Non-`stdio` values are forwarded to interactive Claude. `cctty` does not emulate custom permission prompt tools itself. | Parser coverage only. |
 | `--system-prompt-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage because SDKs/older CLIs may emit it. |
 | `--task-budget`, `--max-thinking-tokens`, `--thinking`, `--thinking-display`, `--managed-settings`, `--resume-session-at` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. These are SDK/newer-CLI compatibility entries, not from the captured help output above. |
 
-### Current P0 Gaps
+### Current High-Risk Gaps
 
-- Permission callbacks are not parity complete. `--permission-mode` is passed
-  through, but terminal permission prompts are not translated into SDK
-  `can_use_tool` control requests.
-- `--no-session-persistence` is not implemented. Interactive Claude writes local
-  transcripts.
+- Permission callbacks have fake-PTY allow/deny coverage and a live transcript
+  observation, but still need a live denial-menu differential on a Claude
+  configuration that actually blocks for approval instead of auto-approving the
+  tool.
 - `--include-partial-messages` is not implemented because transcript tailing does
   not expose partial assistant chunks.
 - `--json-schema`, `--max-budget-usd`, and `--fallback-model` need focused live

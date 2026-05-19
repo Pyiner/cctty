@@ -28,6 +28,7 @@ fn write_fake_claude_script(path: &Path) {
 import json
 import os
 from pathlib import Path
+import select
 import sys
 
 argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
@@ -84,6 +85,48 @@ while True:
     raw_prompt = buf[start + len(b"\x1b[200~"):end] if start >= 0 else buf[:end]
     prompt = raw_prompt.decode("utf-8", errors="replace")
     response = "FAKE_RESPONSE: " + prompt
+    if "USE_FAKE_TOOL" in prompt:
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"echo fake"}}]}}) + "\n")
+        sys.stdout.write("Do you want to allow Bash?\n")
+        sys.stdout.write("❯ 1. Yes\n")
+        sys.stdout.write("  2. No, and tell Claude what to do differently\n")
+        sys.stdout.write("Enter to confirm · Esc to cancel\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        deny = b"\x1b[B" in ack or b"2" in ack or ack.startswith(b"\x1b")
+        deny_reason = ""
+        if deny:
+            sys.stdout.write("Tell Claude what to do differently\n")
+            sys.stdout.flush()
+            ready, _, _ = select.select([0], [], [], 2)
+            if ready:
+                reason_bytes = os.read(0, 4096)
+                start_reason = reason_bytes.find(b"\x1b[200~")
+                end_reason = reason_bytes.find(b"\x1b[201~")
+                if start_reason >= 0 and end_reason >= 0:
+                    deny_reason = reason_bytes[start_reason + len(b"\x1b[200~"):end_reason].decode("utf-8", errors="replace")
+                else:
+                    deny_reason = reason_bytes.decode("utf-8", errors="replace").strip()
+        if deny:
+            response = "FAKE_TOOL_DENIED"
+            if deny_reason:
+                response += ": " + deny_reason
+        else:
+            response = "FAKE_TOOL_ALLOWED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
     with transcript.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
         f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")

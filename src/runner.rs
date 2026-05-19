@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 use crate::args::{CommandMode, InputFormat, Invocation, OutputFormat};
 use crate::error::{CcttyError, Result};
@@ -17,6 +18,7 @@ const TRANSCRIPT_POLL: Duration = Duration::from_millis(80);
 const TRUST_PROMPT_SETTLE: Duration = Duration::from_millis(800);
 const TTY_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const TTY_READY_SETTLE: Duration = Duration::from_millis(250);
+const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -54,12 +56,13 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             .as_ref()
             .map(|session_id| transcript_path(&config_dir, &cwd, session_id))
     };
+    let env = HashMap::new();
 
     let mut process = PtyProcess::spawn(&PtySpawnSpec {
         command: claude,
         args: invocation.passthrough_args.clone(),
         cwd,
-        env: HashMap::new(),
+        env,
     })?;
     prepare_tty_for_prompt(&mut process).await?;
 
@@ -74,11 +77,20 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             write_final_output(&outcome, invocation.output_format)?;
         }
         InputFormat::StreamJson => {
-            run_stream_json(&mut process, &mut tail, invocation.output_format).await?;
+            run_stream_json(
+                &mut process,
+                &mut tail,
+                invocation.output_format,
+                invocation.permission_prompt_tool_stdio,
+            )
+            .await?;
         }
     }
 
     process.kill();
+    if invocation.no_session_persistence {
+        tail.remove_current_transcript()?;
+    }
     Ok(0)
 }
 
@@ -86,6 +98,7 @@ async fn run_stream_json(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
     output_format: OutputFormat,
+    permission_prompt_tool_stdio: bool,
 ) -> Result<()> {
     if output_format != OutputFormat::StreamJson {
         return Err(CcttyError::Usage(
@@ -93,27 +106,75 @@ async fn run_stream_json(
         ));
     }
 
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(trimmed)?;
+    let mut input = spawn_stdin_json_reader();
+    while let Some(value) = input.recv().await {
         match value.get("type").and_then(Value::as_str) {
             Some("control_request") => {
                 handle_control_request(process, &value)?;
             }
+            Some("control_response") => {}
             Some("control_cancel_request") => {}
             Some("user") => {
                 let prompt = user_prompt_from_sdk_message(&value)?;
-                let _ = submit_prompt_and_tail(process, tail, &prompt, output_format).await?;
+                let _ = submit_prompt_and_tail_stream(
+                    process,
+                    tail,
+                    &mut input,
+                    &prompt,
+                    output_format,
+                    permission_prompt_tool_stdio,
+                )
+                .await?;
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn spawn_stdin_json_reader() -> mpsc::Receiver<Value> {
+    let (tx, rx) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let stdin = BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Value>(trimmed) {
+                        Ok(value) => {
+                            if tx.send(value).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx
+                                .send(json!({
+                                    "type": "cctty_stdin_error",
+                                    "error": error.to_string(),
+                                }))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = tx
+                        .send(json!({
+                            "type": "cctty_stdin_error",
+                            "error": error.to_string(),
+                        }))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+    rx
 }
 
 fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()> {
@@ -176,6 +237,26 @@ async fn submit_prompt_and_tail(
     tail_until_complete(tail, output_format).await
 }
 
+async fn submit_prompt_and_tail_stream(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    input: &mut mpsc::Receiver<Value>,
+    prompt: &str,
+    output_format: OutputFormat,
+    permission_prompt_tool_stdio: bool,
+) -> Result<TranscriptState> {
+    tail.prepare_offset()?;
+    process.write_all(&bracketed_paste_input(prompt))?;
+    tail_until_complete_stream(
+        process,
+        tail,
+        input,
+        output_format,
+        permission_prompt_tool_stdio,
+    )
+    .await
+}
+
 async fn tail_until_complete(
     tail: &mut TailCursor,
     output_format: OutputFormat,
@@ -230,6 +311,306 @@ async fn tail_until_complete(
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
+}
+
+async fn tail_until_complete_stream(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    input: &mut mpsc::Receiver<Value>,
+    output_format: OutputFormat,
+    permission_prompt_tool_stdio: bool,
+) -> Result<TranscriptState> {
+    let started = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut state = TranscriptState::default();
+    let mut permission = PermissionBridge::new(permission_prompt_tool_stdio);
+
+    loop {
+        if started.elapsed() > RUN_TIMEOUT {
+            return Err(CcttyError::Timeout(
+                "timed out waiting for Claude transcript".to_owned(),
+            ));
+        }
+
+        if let Some(path) = tail.resolve_path()? {
+            match read_complete_lines(&path, tail.offset).await {
+                Ok((lines, consumed)) if consumed > 0 => {
+                    tail.offset += consumed;
+                    for line in lines {
+                        let value: Value = serde_json::from_str(&line)?;
+                        permission
+                            .maybe_request_tool_permission(process, input, &value)
+                            .await?;
+                        state.apply(&value);
+                        if output_format == OutputFormat::StreamJson {
+                            println!("{}", serde_json::to_string(&value)?);
+                            std::io::stdout().flush()?;
+                        }
+                        last_activity = Instant::now();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CcttyError::Transcript(format!(
+                        "failed to read {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+
+        if state.saw_result {
+            return Ok(state);
+        }
+        if state.saw_assistant && last_activity.elapsed() >= COMPLETION_IDLE {
+            if output_format == OutputFormat::StreamJson && !state.saw_result {
+                let value = synthetic_result(&state, started.elapsed());
+                println!("{}", serde_json::to_string(&value)?);
+                std::io::stdout().flush()?;
+                state.apply(&value);
+            }
+            return Ok(state);
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+}
+
+struct PermissionBridge {
+    enabled: bool,
+    requested_tool_use_ids: HashSet<String>,
+    next_request: u64,
+}
+
+impl PermissionBridge {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            requested_tool_use_ids: HashSet::new(),
+            next_request: 0,
+        }
+    }
+
+    async fn maybe_request_tool_permission(
+        &mut self,
+        process: &mut PtyProcess,
+        input: &mut mpsc::Receiver<Value>,
+        transcript: &Value,
+    ) -> Result<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+
+        let mut requested = false;
+        for tool_use in tool_uses_from_assistant(transcript) {
+            if !self.requested_tool_use_ids.insert(tool_use.id.clone()) {
+                continue;
+            }
+            requested = true;
+            let request_id = format!("cctty_permission_{}", self.next_request);
+            self.next_request += 1;
+            let request = json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": tool_use.name,
+                    "input": tool_use.input,
+                    "permission_suggestions": null,
+                    "blocked_path": null,
+                    "tool_use_id": tool_use.id,
+                }
+            });
+            println!("{}", serde_json::to_string(&request)?);
+            std::io::stdout().flush()?;
+            let response = wait_for_control_response(input, &request_id).await?;
+            apply_permission_decision(process, &tool_use, &response).await?;
+        }
+        Ok(requested)
+    }
+}
+
+#[derive(Debug)]
+struct ToolUse {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+fn tool_uses_from_assistant(value: &Value) -> Vec<ToolUse> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"))
+                .filter_map(|item| {
+                    Some(ToolUse {
+                        id: item.get("id").and_then(Value::as_str)?.to_owned(),
+                        name: item.get("name").and_then(Value::as_str)?.to_owned(),
+                        input: item.get("input").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn wait_for_control_response(
+    input: &mut mpsc::Receiver<Value>,
+    request_id: &str,
+) -> Result<Value> {
+    loop {
+        let value = input.recv().await.ok_or_else(|| {
+            CcttyError::Tty(format!(
+                "stdin closed while waiting for control_response {request_id}"
+            ))
+        })?;
+        if value.get("type").and_then(Value::as_str) == Some("cctty_stdin_error") {
+            return Err(CcttyError::Usage(
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("invalid stdin JSON")
+                    .to_owned(),
+            ));
+        }
+        if value.get("type").and_then(Value::as_str) != Some("control_response") {
+            continue;
+        }
+        let matches_request = value
+            .get("response")
+            .and_then(|response| response.get("request_id"))
+            .and_then(Value::as_str)
+            == Some(request_id);
+        if matches_request {
+            return Ok(value);
+        }
+    }
+}
+
+fn permission_behavior(control_response: &Value) -> Option<String> {
+    control_response
+        .get("response")
+        .and_then(|response| response.get("response"))
+        .and_then(|response| {
+            response
+                .get("behavior")
+                .or_else(|| response.get("decision"))
+        })
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn permission_deny_message(control_response: &Value) -> Option<String> {
+    let response = control_response
+        .get("response")
+        .and_then(|response| response.get("response"))?;
+    response
+        .get("message")
+        .or_else(|| response.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn apply_permission_decision(
+    process: &mut PtyProcess,
+    tool_use: &ToolUse,
+    control_response: &Value,
+) -> Result<()> {
+    let behavior = permission_behavior(control_response)
+        .unwrap_or_else(|| "allow".to_owned())
+        .to_ascii_lowercase();
+    let saw_prompt = wait_for_tty_permission_prompt(process, tool_use).await;
+    if behavior == "deny" {
+        if saw_prompt {
+            process.write_all(b"\x1b[B\r")?;
+            if let Some(message) = permission_deny_message(control_response)
+                && wait_for_tty_permission_feedback_prompt(process).await
+            {
+                process.write_all(&bracketed_paste_input(&message))?;
+            }
+        } else {
+            process.write_all(b"\x1b")?;
+        }
+    } else if saw_prompt {
+        process.write_all(b"\r")?;
+    }
+    Ok(())
+}
+
+async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
+        let output = process.recent_output();
+        if tty_output_has_permission_prompt(&output, tool_use) {
+            return true;
+        }
+        if tty_output_accepts_prompt(&output) && output_mentions_tool_result(&output, tool_use) {
+            return false;
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+    false
+}
+
+async fn wait_for_tty_permission_feedback_prompt(process: &PtyProcess) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
+        let output = process.recent_output();
+        if tty_output_has_permission_feedback_prompt(&output) {
+            return true;
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+    false
+}
+
+fn tty_output_has_permission_prompt(output: &str, tool_use: &ToolUse) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    let tool_name = tool_use.name.as_str();
+    let has_tool = output.contains(tool_name) || compact.contains(tool_name);
+    let has_allow_choice =
+        output.contains("Yes") || output.contains("Allow") || compact.contains("Yes");
+    let has_deny_choice =
+        output.contains("No") || output.contains("Deny") || compact.contains("No");
+    let has_controls = output.contains("Enter to confirm")
+        || output.contains("Esc to cancel")
+        || output.contains("Do you want")
+        || output.contains("Permission required")
+        || compact.contains("Entertoconfirm")
+        || compact.contains("Esctocancel")
+        || compact.contains("Doyouwant")
+        || compact.contains("Permissionrequired");
+    has_tool && has_allow_choice && has_deny_choice && has_controls
+}
+
+fn tty_output_has_permission_feedback_prompt(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    output.contains("tell Claude what to do differently")
+        || output.contains("Tell Claude what to do differently")
+        || output.contains("What should Claude do")
+        || output.contains("reason")
+        || compact.contains("tellClaudewhattododifferently")
+        || compact.contains("TellClaudewhattododifferently")
+}
+
+fn output_mentions_tool_result(output: &str, tool_use: &ToolUse) -> bool {
+    let output = plain_tty_output(output);
+    output.contains(&tool_use.name)
+        && (output.contains("Done")
+            || output.contains("Running")
+            || output.contains("Waiting")
+            || output.contains("⎿"))
 }
 
 fn synthetic_result(state: &TranscriptState, duration: Duration) -> Value {
@@ -490,6 +871,33 @@ impl TailCursor {
         }
         let _ = &self.config_dir;
         Ok(self.path.clone())
+    }
+
+    fn remove_current_transcript(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        remove_dir_if_empty(&self.project_dir)?;
+        remove_dir_if_empty(&self.config_dir.join("projects"))?;
+        Ok(())
+    }
+}
+
+fn remove_dir_if_empty(path: &Path) -> Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
