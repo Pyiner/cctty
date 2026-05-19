@@ -31,6 +31,8 @@ pub struct Invocation {
     pub session_id: Option<String>,
     pub resume: Option<String>,
     pub continue_conversation: bool,
+    pub no_session_persistence: bool,
+    pub permission_prompt_tool_stdio: bool,
 }
 
 impl Invocation {
@@ -51,6 +53,8 @@ impl Invocation {
         let mut session_id = None;
         let mut resume = None;
         let mut continue_conversation = false;
+        let mut no_session_persistence = false;
+        let mut permission_prompt_tool_stdio = false;
 
         let mut index = 0;
         while index < args.len() {
@@ -89,11 +93,31 @@ impl Invocation {
                 index += 2;
                 continue;
             }
-            if arg == "--include-partial-messages"
-                || arg == "--replay-user-messages"
-                || arg == "--no-session-persistence"
-            {
+            if arg == "--include-partial-messages" || arg == "--replay-user-messages" {
                 index += 1;
+                continue;
+            }
+            if arg == "--no-session-persistence" {
+                no_session_persistence = true;
+                index += 1;
+                continue;
+            }
+            if let Some(value) = long_equals_value(&arg, "--permission-prompt-tool") {
+                permission_prompt_tool_stdio = value == "stdio";
+                if !permission_prompt_tool_stdio {
+                    passthrough_args.push(arg);
+                }
+                index += 1;
+                continue;
+            }
+            if arg == "--permission-prompt-tool" {
+                let value = take_value(&args, index, "--permission-prompt-tool")?.to_owned();
+                permission_prompt_tool_stdio = value == "stdio";
+                if !permission_prompt_tool_stdio {
+                    passthrough_args.push(arg);
+                    passthrough_args.push(value);
+                }
+                index += 2;
                 continue;
             }
 
@@ -194,6 +218,8 @@ impl Invocation {
             session_id,
             resume,
             continue_conversation,
+            no_session_persistence,
+            permission_prompt_tool_stdio,
         })
     }
 
@@ -207,6 +233,8 @@ impl Invocation {
             session_id: None,
             resume: None,
             continue_conversation: false,
+            no_session_persistence: false,
+            permission_prompt_tool_stdio: false,
         }
     }
 }
@@ -442,6 +470,65 @@ mod tests {
                 "permission mode {mode} was not passed through"
             );
         }
+    }
+
+    #[test]
+    fn parse_tracks_permission_prompt_stdio() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--print".to_owned(),
+            "--permission-prompt-tool".to_owned(),
+            "stdio".to_owned(),
+            "hello".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(invocation.permission_prompt_tool_stdio);
+        assert!(
+            invocation
+                .passthrough_args
+                .iter()
+                .all(|arg| arg != "--permission-prompt-tool" && arg != "stdio")
+        );
+    }
+
+    #[test]
+    fn parse_forwards_non_stdio_permission_prompt_tool() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--print".to_owned(),
+            "--permission-prompt-tool".to_owned(),
+            "custom-permission-tool".to_owned(),
+            "hello".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(!invocation.permission_prompt_tool_stdio);
+        assert!(
+            invocation
+                .passthrough_args
+                .windows(2)
+                .any(|arg| arg == ["--permission-prompt-tool", "custom-permission-tool"])
+        );
+    }
+
+    #[test]
+    fn parse_tracks_no_session_persistence_without_forwarding_it() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--print".to_owned(),
+            "--no-session-persistence".to_owned(),
+            "hello".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(invocation.no_session_persistence);
+        assert!(
+            !invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg == "--no-session-persistence")
+        );
     }
 
     struct OptionCase {
