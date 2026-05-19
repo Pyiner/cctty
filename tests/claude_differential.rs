@@ -1,6 +1,7 @@
-use std::io::Read;
-use std::process::Command;
-use std::time::Duration;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use wait_timeout::ChildExt;
@@ -59,6 +60,204 @@ fn live_stream_json_shape_matches_claude_print() {
     assert!(has_type(&cctty, "result"), "cctty output: {cctty:?}");
     assert!(assistant_text(&claude).contains("CCTTY_DIFF_OK"));
     assert!(assistant_text(&cctty).contains("CCTTY_DIFF_OK"));
+}
+
+#[test]
+#[ignore = "requires real Claude CLI auth and spends real Claude calls"]
+fn live_permission_prompt_stdio_honors_project_ask_rules() {
+    if std::env::var("CCTTY_LIVE_PERMISSION").ok().as_deref() != Some("1") {
+        eprintln!("set CCTTY_LIVE_PERMISSION=1 to run this live permission test");
+        return;
+    }
+
+    let allowed = run_live_permission_case("cctty-live-permission-allow", "allow");
+    assert_eq!(
+        allowed.request["request"]["input"]["command"],
+        "printf cctty-live-permission-allow"
+    );
+    assert!(allowed.tool_result.contains("cctty-live-permission-allow"));
+    assert!(allowed.assistant_text.contains("Done"));
+    assert_eq!(allowed.result["is_error"], false);
+
+    let denied = run_live_permission_case("cctty-live-permission-deny", "deny");
+    assert_eq!(
+        denied.request["request"]["input"]["command"],
+        "printf cctty-live-permission-deny"
+    );
+    assert!(denied.tool_result.contains("rejected"));
+    assert!(!denied.tool_result.contains("cctty-live-permission-deny"));
+    assert_eq!(denied.result["is_error"], true);
+    assert_eq!(denied.result["result"], "Permission denied");
+}
+
+struct LivePermissionOutcome {
+    request: Value,
+    result: Value,
+    tool_result: String,
+    assistant_text: String,
+}
+
+fn run_live_permission_case(token: &str, behavior: &str) -> LivePermissionOutcome {
+    let workspace = tempfile::tempdir().unwrap();
+    let claude_dir = workspace.path().join(".claude");
+    std::fs::create_dir(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.local.json"),
+        serde_json::json!({
+            "permissions": {
+                "ask": ["Bash(printf:*)"],
+                "defaultMode": "default",
+                "disableAutoMode": "disable"
+            },
+            "disableAllHooks": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .current_dir(workspace.path())
+        .env("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            &session_id,
+            "--permission-mode",
+            "default",
+            "--no-chrome",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to run cctty: {error}"));
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "Use Bash to run exactly `printf {token}`, then respond Done. Do not modify files."
+                )
+            }
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut request = None;
+    let mut result = None;
+    let mut tool_result = String::new();
+    let mut assistant_text = String::new();
+    let mut raw_stdout = String::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = remaining.min(Duration::from_millis(500));
+        match rx.recv_timeout(timeout) {
+            Ok(line) => {
+                raw_stdout.push_str(&line);
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                match value.get("type").and_then(Value::as_str) {
+                    Some("control_request") => {
+                        assert!(request.is_none(), "duplicate control_request\n{raw_stdout}");
+                        let request_id = value["request_id"].as_str().unwrap();
+                        let mut response = serde_json::json!({ "behavior": behavior });
+                        if behavior == "deny" {
+                            response["message"] =
+                                Value::String("Do not run this command".to_owned());
+                        }
+                        writeln!(
+                            stdin,
+                            "{}",
+                            serde_json::json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": request_id,
+                                    "response": response
+                                }
+                            })
+                        )
+                        .unwrap();
+                        stdin.flush().unwrap();
+                        request = Some(value);
+                    }
+                    Some("assistant") => {
+                        assistant_text.push_str(&assistant_text_from_value(&value));
+                    }
+                    Some("user") => {
+                        tool_result.push_str(&tool_result_text_from_value(&value));
+                    }
+                    Some("result") => {
+                        result = Some(value);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    drop(stdin);
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("cctty did not exit\nstdout:\n{raw_stdout}");
+        });
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr).unwrap();
+    }
+    assert!(status.success(), "stderr:\n{stderr}\nstdout:\n{raw_stdout}");
+
+    LivePermissionOutcome {
+        request: request
+            .unwrap_or_else(|| panic!("missing control_request\nstdout:\n{raw_stdout}")),
+        result: result.unwrap_or_else(|| panic!("missing result\nstdout:\n{raw_stdout}")),
+        tool_result,
+        assistant_text,
+    }
 }
 
 fn run_jsonl(bin: &str, cwd: &std::path::Path, args: &[&str]) -> Vec<Value> {
@@ -136,6 +335,44 @@ fn assistant_text(lines: &[Value]) -> String {
                     && let Some(text) = item.get("text").and_then(Value::as_str)
                 {
                     out.push_str(text);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn assistant_text_from_value(value: &Value) -> String {
+    let mut out = String::new();
+    if let Some(items) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = item.get("text").and_then(Value::as_str)
+            {
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
+fn tool_result_text_from_value(value: &Value) -> String {
+    let mut out = String::new();
+    if let Some(items) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                match item.get("content") {
+                    Some(Value::String(text)) => out.push_str(text),
+                    Some(other) => out.push_str(&other.to_string()),
+                    None => {}
                 }
             }
         }

@@ -73,6 +73,14 @@ real Claude CLI. These require local Claude auth and spend real Claude calls:
 CCTTY_LIVE_CLAUDE_DIFF=1 cargo test --test claude_differential -- --ignored --nocapture
 ```
 
+The focused live permission test forces a per-project Bash approval prompt with
+a temporary `.claude/settings.local.json`, then verifies both SDK allow and deny
+responses against the real interactive Claude TTY:
+
+```sh
+CCTTY_LIVE_PERMISSION=1 cargo test --test claude_differential live_permission_prompt_stdio_honors_project_ask_rules -- --ignored --nocapture
+```
+
 ## Compatibility Matrix
 
 Captured from `claude --help` on Claude Code `2.1.144`.
@@ -125,7 +133,7 @@ Status legend:
 | `--no-chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--no-session-persistence` | Supported | Consumed by `cctty`. The underlying interactive run uses the normal Claude config/auth, then `cctty` removes the generated transcript and empty project directories after the run. | Parser coverage plus fake-PTY persistence cleanup test. This preserves auth better than replacing `CLAUDE_CONFIG_DIR`. |
 | `--output-format` | Partial | `text`, `json`, and `stream-json` are emitted by `cctty`. `stream-json` includes transcript frames plus a synthetic `result` frame if interactive Claude did not write one. | Fake-PTY and live stream-json differential pass. Result metadata is partial. |
-| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions` only. |
+| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions`; live permission coverage also exercises `default` with a project-local `permissions.ask` rule. Other modes still need focused live tests. |
 | `--plugin-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--plugin-url` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `-p`, `--print` | Supported | Consumed by `cctty`; underlying Claude is intentionally launched interactively through a PTY. | Fake-PTY and live differential pass for basic query. |
@@ -150,17 +158,17 @@ Some SDKs pass flags that are not listed in current `claude --help`.
 
 | Option(s) | Status | Current handling | Notes |
 | --- | --- | --- | --- |
-| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries, emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive TTY permission UI by keyboard: allow confirms the selected approval row; deny selects the `No` row and pastes the SDK denial message into Claude's follow-up form when present. | Fake-PTY tests cover allow and deny keyboard flows and assert the flag is not forwarded. Live interactive observation on Claude Code `2.1.144` confirmed tool-use details are available in the transcript before the tool result; this developer machine auto-approved the safe Bash probe, so live denial-menu parity is still pending. |
+| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries and also recognizes real TTY permission forms when Claude has not persisted the transcript yet. It emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive permission UI by keyboard: allow confirms the selected approval row; deny selects menu item `2` and pastes the SDK denial message into Claude's follow-up form when present. If interactive Claude returns to the prompt after a rejected tool without writing a final result, `cctty` emits a synthetic error result with `result: "Permission denied"`. | Fake-PTY tests cover transcript-first allow/deny, TTY-form-before-transcript, and transcript-vs-TTY description precedence. Live Claude Code `2.1.144` coverage forces `Bash(printf:*)` approval with project-local settings and verifies both allow and deny. Still partial: non-Bash TTY forms, exact `permission_suggestions`, and exact `blocked_path` parity are not complete. |
 | `--permission-prompt-tool <name>` | Pass-through | Non-`stdio` values are forwarded to interactive Claude. `cctty` does not emulate custom permission prompt tools itself. | Parser coverage only. |
 | `--system-prompt-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage because SDKs/older CLIs may emit it. |
 | `--task-budget`, `--max-thinking-tokens`, `--thinking`, `--thinking-display`, `--managed-settings`, `--resume-session-at` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. These are SDK/newer-CLI compatibility entries, not from the captured help output above. |
 
 ### Current High-Risk Gaps
 
-- Permission callbacks have fake-PTY allow/deny coverage and a live transcript
-  observation, but still need a live denial-menu differential on a Claude
-  configuration that actually blocks for approval instead of auto-approving the
-  tool.
+- Permission callbacks now have fake-PTY allow/deny coverage and a live
+  `Bash(printf:*)` approval differential for both allow and deny. Remaining
+  risk is breadth: non-Bash permission forms, `allowedTools`/`disallowedTools`
+  interactions, and exact SDK metadata fields still need live coverage.
 - `--include-partial-messages` is not implemented because transcript tailing does
   not expose partial assistant chunks.
 - `--json-schema`, `--max-budget-usd`, and `--fallback-model` need focused live
