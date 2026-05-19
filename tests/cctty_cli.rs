@@ -67,6 +67,82 @@ fn stream_json_text_prompt_uses_tty_transcript() {
     assert_eq!(lines[3]["result"], "FAKE_RESPONSE: Say OK");
 }
 
+#[test]
+fn passes_all_permission_modes_to_underlying_claude_tty() {
+    for mode in [
+        "acceptEdits",
+        "auto",
+        "bypassPermissions",
+        "default",
+        "dontAsk",
+        "plan",
+    ] {
+        let fixture = FakeClaude::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let argv_path = tempfile::NamedTempFile::new().unwrap();
+
+        Command::cargo_bin("cctty")
+            .unwrap()
+            .env("CCTTY_CLAUDE_PATH", fixture.path())
+            .env("CLAUDE_CONFIG_DIR", config_dir.path())
+            .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+            .current_dir(workspace.path())
+            .args([
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--permission-mode",
+                mode,
+                "Check mode",
+            ])
+            .assert()
+            .success();
+
+        let argv: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--permission-mode", mode]),
+            "permission mode {mode} not forwarded in argv {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn passes_agent_definition_flags_to_underlying_claude_tty() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let agents =
+        r#"{"reviewer":{"description":"Review synthetic code","prompt":"Review carefully"}}"#;
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--agents",
+            agents,
+            "--agent",
+            "reviewer",
+            "Use reviewer",
+        ])
+        .assert()
+        .success();
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(argv.windows(2).any(|pair| pair == ["--agents", agents]));
+    assert!(argv.windows(2).any(|pair| pair == ["--agent", "reviewer"]));
+}
+
 fn json_types(lines: &[Value]) -> Vec<&str> {
     lines
         .iter()

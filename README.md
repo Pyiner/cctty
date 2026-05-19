@@ -2,11 +2,15 @@
 
 `cctty` is a Claude CLI replacement for non-interactive SDK usage.
 
-The binary accepts Claude-style arguments. Normal interactive commands, `--help`,
-and `--version` are proxied to the real `claude` binary. The `--print` /
-`--input-format stream-json` path is handled by starting interactive Claude in a
-PTY, submitting prompts with bracketed paste, tailing Claude's JSONL transcript,
-and emitting `text`, `json`, or `stream-json` output.
+The goal is drop-in compatibility, but this repository does not claim full
+Claude CLI parity yet. The table below is the compatibility contract for the
+current implementation.
+
+Normal interactive commands, `--help`, and `--version` are proxied to the real
+`claude` binary. The `--print` / `--input-format stream-json` path is handled by
+starting interactive Claude in a PTY, submitting prompts with bracketed paste,
+tailing Claude's JSONL transcript, and emitting `text`, `json`, or
+`stream-json` output.
 
 This keeps native Claude Agent SDK callers on their normal subprocess protocol
 while avoiding direct use of Claude's non-interactive execution path.
@@ -69,14 +73,97 @@ real Claude CLI. These require local Claude auth and spend real Claude calls:
 CCTTY_LIVE_CLAUDE_DIFF=1 cargo test --test claude_differential -- --ignored --nocapture
 ```
 
-## Compatibility Notes
+## Compatibility Matrix
 
-The target contract is CLI replacement parity: every Claude argument should be
-accepted, and print-mode behavior should be checked through differential tests.
-The current implementation covers the core SDK query path, stream JSON input,
-text/json/stream-json output, session IDs, resume transcript lookup, and
-pass-through of non-print commands.
+Captured from `claude --help` on Claude Code `2.1.144`.
 
-Advanced SDK control requests beyond `initialize` and `interrupt` are currently
-reported as unsupported rather than silently faked. Those should be added with
-focused differential tests as the next compatibility slices.
+Status legend:
+
+- Supported: implemented by `cctty`, or proxied to real Claude with a passing
+  test for the relevant path.
+- Pass-through: forwarded to the underlying interactive Claude TTY. Parser
+  coverage exists, but behavior parity still belongs to Claude and may need a
+  live differential before users rely on it for SDK replacement.
+- Partial: accepted, but output or behavior is known to differ from
+  `claude --print`.
+- Unsupported: accepted only as a no-op or not bridged yet. Do not rely on it.
+
+| Option(s) | Status | Current handling in `cctty --print` | Test coverage / known difference |
+| --- | --- | --- | --- |
+| `--add-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--agent`, `--agents` | Pass-through | Forwarded to interactive Claude. | Parser coverage plus fake-PTY argv capture. No live agent behavior differential yet. |
+| `--allow-dangerously-skip-permissions` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--allowedTools`, `--allowed-tools` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. Permission behavior not live-tested. |
+| `--append-system-prompt` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--bare` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. Bare auth/config behavior not differential-tested. |
+| `--betas` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--brief` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `-c`, `--continue` | Partial | Forwarded. Transcript tail falls back to newest project transcript because no session id is known up front. | Parser coverage only. Needs live resume/continue differential. |
+| `--dangerously-skip-permissions` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. Dangerous behavior is intentionally not exercised in default tests. |
+| `-d`, `--debug` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--debug-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--disable-slash-commands` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--disallowedTools`, `--disallowed-tools` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. Tool-denial behavior not live-tested yet. |
+| `--effort` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--exclude-dynamic-system-prompt-sections` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--fallback-model` | Partial | Forwarded, but Claude documents this as print-only. Since `cctty` runs underlying Claude interactively, parity is not proven. | Parser coverage only. Needs live overload/fallback strategy test. |
+| `--file` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--fork-session` | Partial | Forwarded. `cctty` tails whichever transcript Claude writes. | Parser coverage only. Needs live resume/fork differential. |
+| `--from-pr` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `-h`, `--help` | Supported | Entire command is proxied to real Claude. | Fake proxy test covers `--version`; README coverage test covers both aliases. |
+| `--ide` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--include-hook-events` | Partial | Forwarded. Hook events appear only if interactive transcript writes them; stream semantics are not guaranteed to match `--print`. | Parser coverage only. |
+| `--include-partial-messages` | Unsupported | Consumed by `cctty`; no partial assistant chunks are emitted because transcript tailing only sees persisted messages. | Parser coverage marks it consumed. |
+| `--input-format` | Supported | `text` prompts are read from argv/stdin. `stream-json` SDK input is read from stdin. | Fake-PTY test, Python SDK test, TypeScript SDK test. |
+| `--json-schema` | Partial | Forwarded, but `cctty` synthesizes result frames when interactive transcript lacks one; `structured_output` parity is not proven. | Parser coverage only. Needs structured-output differential. |
+| `--max-budget-usd` | Partial | Forwarded, but Claude documents this as print-only. Underlying interactive behavior is not proven equivalent. | Parser coverage only. |
+| `--mcp-config` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. SDK MCP control messages are not bridged yet. |
+| `--mcp-debug` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--model` | Pass-through | Forwarded to interactive Claude. | Parser coverage and live differential with default configured model path. Specific model aliases not exhaustively tested. |
+| `-n`, `--name` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--no-chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--no-session-persistence` | Unsupported | Consumed by `cctty`, but underlying interactive Claude still persists to its transcript store. | Parser coverage marks it consumed. Needs an explicit temp-store/delete strategy before claiming support. |
+| `--output-format` | Partial | `text`, `json`, and `stream-json` are emitted by `cctty`. `stream-json` includes transcript frames plus a synthetic `result` frame if interactive Claude did not write one. | Fake-PTY and live stream-json differential pass. Result metadata is partial. |
+| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions` only. Permission prompts are not bridged into SDK callbacks yet. |
+| `--plugin-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--plugin-url` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `-p`, `--print` | Supported | Consumed by `cctty`; underlying Claude is intentionally launched interactively through a PTY. | Fake-PTY and live differential pass for basic query. |
+| `--remote-control` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. Remote Control warnings may appear in transcript as system messages. |
+| `--remote-control-session-name-prefix` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--replay-user-messages` | Partial | Consumed by `cctty`. User transcript frames may still be emitted, but exact replay semantics are not implemented separately. | Parser coverage marks it consumed. |
+| `-r`, `--resume` | Partial | Forwarded. `cctty` tails the requested session transcript when a session id is supplied. | Parser coverage only. Needs live resume differential. |
+| `--session-id` | Supported | Forwarded and used to locate the transcript. If omitted in print mode, `cctty` creates one. | Fake-PTY and live differential cover session-id based transcript tailing. |
+| `--setting-sources` | Pass-through | Forwarded to interactive Claude. | Parser coverage, including `--setting-sources=project`. |
+| `--settings` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--strict-mcp-config` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--system-prompt` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--tmux` | Pass-through | Forwarded. `--tmux=classic` is preserved as an equals-form flag; plain `--tmux` does not swallow the prompt. | Parser regression test. |
+| `--tools` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+| `--verbose` | Pass-through | Forwarded. `cctty` itself does not require it for stream-json, but real Claude does, so SDK callers usually include it. | Parser and live differential coverage. |
+| `-v`, `--version` | Supported | Entire command is proxied to real Claude. | Fake proxy test covers `--version`. |
+| `-w`, `--worktree` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
+
+### SDK / Hidden Flag Compatibility
+
+Some SDKs pass flags that are not listed in current `claude --help`.
+
+| Option(s) | Status | Current handling | Notes |
+| --- | --- | --- | --- |
+| `--permission-prompt-tool` | Unsupported for callbacks | Forwarded if supplied, but `cctty` does not yet bridge Claude TTY permission prompts to SDK `can_use_tool` callbacks. | This is the largest permission gap. SDK callers using `can_use_tool` should not rely on `cctty` yet. |
+| `--system-prompt-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage because SDKs/older CLIs may emit it. |
+| `--task-budget`, `--max-thinking-tokens`, `--thinking`, `--thinking-display`, `--managed-settings`, `--resume-session-at` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. These are SDK/newer-CLI compatibility entries, not from the captured help output above. |
+
+### Current P0 Gaps
+
+- Permission callbacks are not parity complete. `--permission-mode` is passed
+  through, but terminal permission prompts are not translated into SDK
+  `can_use_tool` control requests.
+- `--no-session-persistence` is not implemented. Interactive Claude writes local
+  transcripts.
+- `--include-partial-messages` is not implemented because transcript tailing does
+  not expose partial assistant chunks.
+- `--json-schema`, `--max-budget-usd`, and `--fallback-model` need focused live
+  differentials before being marked supported.
+- SDK control requests beyond `initialize` and `interrupt` are currently
+  reported as unsupported rather than silently faked.

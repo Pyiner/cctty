@@ -1,6 +1,9 @@
+use std::io::Read;
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::Value;
+use wait_timeout::ChildExt;
 #[test]
 #[ignore = "requires real Claude CLI auth and spends one Claude call"]
 fn live_stream_json_shape_matches_claude_print() {
@@ -59,21 +62,52 @@ fn live_stream_json_shape_matches_claude_print() {
 }
 
 fn run_jsonl(bin: &str, cwd: &std::path::Path, args: &[&str]) -> Vec<Value> {
-    let output = Command::new(bin)
+    let mut child = Command::new(bin)
         .current_dir(cwd)
         .env("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
         .args(args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap_or_else(|error| panic!("failed to run {bin}: {error}"));
+    let status = child
+        .wait_timeout(Duration::from_secs(120))
+        .unwrap_or_else(|error| panic!("failed waiting for {bin}: {error}"));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_end(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_end(&mut stderr);
+        }
+        panic!(
+            "{bin} timed out\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout)
+            .unwrap_or_else(|error| panic!("failed reading {bin} stdout: {error}"));
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr)
+            .unwrap_or_else(|error| panic!("failed reading {bin} stderr: {error}"));
+    }
+    let status = status.unwrap();
 
     assert!(
-        output.status.success(),
+        status.success(),
         "{bin} failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     );
 
-    String::from_utf8(output.stdout)
+    String::from_utf8(stdout)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
