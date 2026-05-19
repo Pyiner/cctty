@@ -85,6 +85,59 @@ while True:
     raw_prompt = buf[start + len(b"\x1b[200~"):end] if start >= 0 else buf[:end]
     prompt = raw_prompt.decode("utf-8", errors="replace")
     response = "FAKE_RESPONSE: " + prompt
+    if "USE_TTY_ONLY_FAKE_TOOL" in prompt:
+        sys.stdout.write("Bash command echo tty fake Permission rule Bash(echo:*) requires confirmation for this command.\n")
+        sys.stdout.write("Do you want to proceed?\n")
+        sys.stdout.write("❯ 1. Yes\n")
+        sys.stdout.write("  2. No\n")
+        sys.stdout.write("Esc to cancel · Tab to amend · ctrl+e to explain\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        if b"\x1b[B" in ack or b"2" in ack or ack.startswith(b"\x1b"):
+            response = "FAKE_TTY_TOOL_DENIED"
+        else:
+            response = "FAKE_TTY_TOOL_ALLOWED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-tty-1","name":"Bash","input":{"command":"echo tty fake"}}]}}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-tty-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
+    if "USE_FAKE_TOOL_WITH_TTY_DESCRIPTION" in prompt:
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-desc-1","name":"Bash","input":{"command":"printf fake-token","description":"Print test string"}}]}}) + "\n")
+        sys.stdout.write("Bash command printf fake-token Print test string Permission rule Bash(printf:*) requires confirmation for this command.\n")
+        sys.stdout.write("Do you want to proceed?\n")
+        sys.stdout.write("❯ 1. Yes\n")
+        sys.stdout.write("  2. No\n")
+        sys.stdout.write("Esc to cancel · Tab to amend · ctrl+e to explain\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        if b"\x1b[B" in ack or b"2" in ack or ack.startswith(b"\x1b"):
+            response = "FAKE_TOOL_WITH_DESCRIPTION_DENIED"
+        else:
+            response = "FAKE_TOOL_WITH_DESCRIPTION_ALLOWED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-desc-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
     if "USE_FAKE_TOOL" in prompt:
         with transcript.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")

@@ -369,6 +369,203 @@ fn stream_json_permission_prompt_stdio_maps_denial_to_keyboard_form() {
     assert!(status.success());
 }
 
+#[test]
+fn stream_json_permission_prompt_stdio_reads_tty_form_before_transcript_tool_use() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000005";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_TTY_ONLY_FAKE_TOOL"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut permission_request_count = 0;
+    let mut saw_allowed_result = false;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                permission_request_count += 1;
+                assert_eq!(
+                    value["request"]["subtype"],
+                    Value::String("can_use_tool".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["tool_name"],
+                    Value::String("Bash".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["input"]["command"],
+                    Value::String("echo tty fake".to_owned())
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow"
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                saw_allowed_result = value["result"] == "FAKE_TTY_TOOL_ALLOWED";
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        permission_request_count, 1,
+        "expected exactly one can_use_tool control_request"
+    );
+    assert!(saw_allowed_result, "expected allowed fake TTY tool result");
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_permission_prompt_stdio_prefers_transcript_tool_use_over_tty_description() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000006";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_FAKE_TOOL_WITH_TTY_DESCRIPTION"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut permission_request_count = 0;
+    let mut saw_allowed_result = false;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                permission_request_count += 1;
+                assert_eq!(
+                    value["request"]["input"]["command"],
+                    Value::String("printf fake-token".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["input"]["description"],
+                    Value::String("Print test string".to_owned())
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow"
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                saw_allowed_result = value["result"] == "FAKE_TOOL_WITH_DESCRIPTION_ALLOWED";
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        permission_request_count, 1,
+        "expected exactly one can_use_tool control_request"
+    );
+    assert!(
+        saw_allowed_result,
+        "expected allowed fake tool-with-description result"
+    );
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
 fn json_types(lines: &[Value]) -> Vec<&str> {
     lines
         .iter()
