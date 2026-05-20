@@ -9,10 +9,10 @@ terminal the way a person would, and translates the session back into
 SDK-compatible `stream-json` messages.
 
 If the non-interactive Claude Code or Claude Agent SDK execution path becomes
-unavailable, restricted, too expensive, or behaviorally different from the
-terminal experience, `cctty` gives you a practical fallback: keep the official
-Python or TypeScript SDK, but run the actual Claude Code work through the
-interactive terminal.
+separately billed, unavailable, restricted, too expensive, or behaviorally
+different from the terminal experience, `cctty` gives you a practical fallback:
+keep the official Python or TypeScript SDK, but run the actual Claude Code work
+through the interactive terminal.
 
 In other words: **Claude Code SDK compatibility, powered by the interactive
 Claude Code terminal.**
@@ -31,6 +31,9 @@ expect.
 
 Use `cctty` when you want:
 
+- **A practical answer to separate Claude Agent SDK billing.** Keep the SDK
+  integration surface, but execute the work through interactive Claude Code in a
+  terminal session.
 - **A Claude Code SDK alternative without leaving the official SDKs.** Keep
   using `claude-agent-sdk` for Python or `@anthropic-ai/claude-agent-sdk` for
   TypeScript. `cctty` replaces only the executable path.
