@@ -1,14 +1,53 @@
 # cctty
 
-**A drop-in Claude Agent SDK runner backed by the interactive Claude TTY.**
+**Use Claude Code through a real terminal while keeping the official Python and
+TypeScript Claude Agent SDKs.**
 
-`cctty` lets existing Python and TypeScript Claude Agent SDK apps keep using the
-normal SDK protocol while the actual work is performed by the interactive
-`claude` CLI running inside a PTY. If the non-interactive Claude Code execution
-path changes pricing, behavior, or availability, point your SDK at `cctty` and
-keep the rest of your agent code intact.
+`cctty` is a drop-in `claude` executable replacement for Claude Agent SDK apps.
+It launches the interactive Claude Code CLI inside a real PTY, drives the
+terminal the way a person would, and translates the session back into
+SDK-compatible `stream-json` messages.
 
-What changes in your app?
+If the non-interactive Claude Code or Claude Agent SDK execution path becomes
+unavailable, restricted, too expensive, or behaviorally different from the
+terminal experience, `cctty` gives you a practical fallback: keep the official
+Python or TypeScript SDK, but run the actual Claude Code work through the
+interactive terminal.
+
+In other words: **Claude Code SDK compatibility, powered by the interactive
+Claude Code terminal.**
+
+## Why cctty?
+
+Claude Code has two very different surfaces:
+
+- the terminal UI that humans use interactively;
+- the non-interactive SDK/`stream-json` path that agent applications launch.
+
+`cctty` bridges those surfaces. It starts interactive Claude Code in a TTY,
+submits prompts with bracketed paste, watches Claude's transcript, handles
+keyboard-driven permission forms, and emits the messages that the official SDKs
+expect.
+
+Use `cctty` when you want:
+
+- **A Claude Code SDK alternative without leaving the official SDKs.** Keep
+  using `claude-agent-sdk` for Python or `@anthropic-ai/claude-agent-sdk` for
+  TypeScript. `cctty` replaces only the executable path.
+- **Terminal-native Claude Code behavior.** The work is done by the interactive
+  `claude` CLI inside a PTY, not by reimplementing Claude Code.
+- **Permission callbacks that still work.** SDK `can_use_tool` approvals are
+  bridged to Claude's keyboard-driven TTY permission forms for Bash and file
+  writes.
+- **A testable compatibility contract.** Every captured `claude --help` flag is
+  listed below with support status, known gaps, and test coverage.
+- **A real SDK smoke test path.** The live suite asks both Python and
+  TypeScript SDKs to build a browser mini-game under `permissionMode: "default"`
+  and verifies the files are created through SDK approvals.
+
+## Drop-in SDK Replacement
+
+For most SDK apps, only one thing changes: the Claude executable path.
 
 One executable path:
 
@@ -30,22 +69,6 @@ of the SDK surface continue to flow through the SDK you already use.
 
 `cctty` is not affiliated with Anthropic. It still requires a locally installed
 and authenticated Claude Code CLI.
-
-## Why cctty?
-
-- **Keep official SDKs.** Use `claude-agent-sdk` for Python or
-  `@anthropic-ai/claude-agent-sdk` for TypeScript. `cctty` replaces only the
-  CLI executable the SDK launches.
-- **Avoid the non-interactive execution path.** `cctty` drives interactive
-  Claude through a real TTY, submits prompts with bracketed paste, tails
-  Claude's transcript, and emits SDK-compatible `stream-json`.
-- **Preserve permission callbacks.** SDK `can_use_tool` approvals are bridged to
-  Claude's keyboard-driven TTY permission forms for Bash and file writes.
-- **Tested against real SDKs.** The live suite asks both Python and TypeScript
-  SDKs to build a browser mini-game under `permissionMode: "default"` and
-  verifies the files are created through SDK approvals.
-- **Transparent compatibility contract.** Every captured `claude --help` flag is
-  listed below with support status and known gaps.
 
 ## Install
 
