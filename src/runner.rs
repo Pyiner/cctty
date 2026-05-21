@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::args::{CommandMode, InputFormat, Invocation, OutputFormat};
 use crate::error::{CcttyError, Result};
@@ -73,9 +74,14 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
     match invocation.input_format {
         InputFormat::Text => {
             let prompt = prompt_from_invocation(&invocation)?;
-            let outcome =
-                submit_prompt_and_tail(&mut process, &mut tail, &prompt, invocation.output_format)
-                    .await?;
+            let outcome = submit_prompt_and_tail(
+                &mut process,
+                &mut tail,
+                &prompt,
+                invocation.output_format,
+                invocation.include_partial_messages,
+            )
+            .await?;
             write_final_output(&outcome, invocation.output_format)?;
         }
         InputFormat::StreamJson => {
@@ -84,6 +90,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
                 &mut tail,
                 invocation.output_format,
                 invocation.permission_prompt_tool_stdio,
+                invocation.include_partial_messages,
             )
             .await?;
         }
@@ -119,6 +126,7 @@ async fn run_stream_json(
     tail: &mut TailCursor,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
+    include_partial_messages: bool,
 ) -> Result<()> {
     if output_format != OutputFormat::StreamJson {
         return Err(CcttyError::Usage(
@@ -143,6 +151,7 @@ async fn run_stream_json(
                     &prompt,
                     output_format,
                     permission_prompt_tool_stdio,
+                    include_partial_messages,
                 )
                 .await?;
             }
@@ -209,11 +218,16 @@ fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()>
         .unwrap_or("unknown");
 
     let response = match subtype {
-        "initialize" => control_success(request_id, json!({})),
+        "initialize" => control_success(request_id, sdk_initialize_response()),
         "interrupt" => {
             process.interrupt()?;
             control_success(request_id, Value::Null)
         }
+        "set_model" => control_success(request_id, Value::Null),
+        "set_permission_mode" => control_success(request_id, Value::Null),
+        "set_max_thinking_tokens" => control_success(request_id, Value::Null),
+        "apply_flag_settings" => control_success(request_id, Value::Null),
+        "mcp_status" => control_success(request_id, json!({ "mcpServers": [] })),
         _ => control_error(
             request_id,
             format!("Unsupported control request: {subtype}"),
@@ -222,6 +236,32 @@ fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()>
     println!("{}", serde_json::to_string(&response)?);
     std::io::stdout().flush()?;
     Ok(())
+}
+
+fn sdk_initialize_response() -> Value {
+    json!({
+        "commands": [],
+        "agents": [],
+        "output_style": "default",
+        "available_output_styles": ["default"],
+        "models": [
+            {
+                "value": "default",
+                "displayName": "Default",
+                "description": "Claude Code default model through cctty",
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                "supportsAdaptiveThinking": true,
+                "supportsAutoMode": true,
+            },
+        ],
+        "account": {
+            "tokenSource": "cctty",
+            "apiProvider": "firstParty",
+        },
+        "fast_mode_state": "off",
+        "pid": std::process::id(),
+    })
 }
 
 fn control_success(request_id: &str, response: Value) -> Value {
@@ -251,10 +291,11 @@ async fn submit_prompt_and_tail(
     tail: &mut TailCursor,
     prompt: &str,
     output_format: OutputFormat,
+    include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
     process.write_all(&bracketed_paste_input(prompt))?;
-    tail_until_complete(tail, output_format).await
+    tail_until_complete(tail, output_format, include_partial_messages).await
 }
 
 async fn submit_prompt_and_tail_stream(
@@ -264,6 +305,7 @@ async fn submit_prompt_and_tail_stream(
     prompt: &str,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
+    include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
     process.write_all(&bracketed_paste_input(prompt))?;
@@ -273,6 +315,7 @@ async fn submit_prompt_and_tail_stream(
         input,
         output_format,
         permission_prompt_tool_stdio,
+        include_partial_messages,
     )
     .await
 }
@@ -280,6 +323,7 @@ async fn submit_prompt_and_tail_stream(
 async fn tail_until_complete(
     tail: &mut TailCursor,
     output_format: OutputFormat,
+    include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     let started = Instant::now();
     let mut last_activity = Instant::now();
@@ -299,10 +343,12 @@ async fn tail_until_complete(
                     for line in lines {
                         let value: Value = serde_json::from_str(&line)?;
                         state.apply(&value);
-                        if output_format == OutputFormat::StreamJson {
-                            println!("{}", serde_json::to_string(&value)?);
-                            std::io::stdout().flush()?;
-                        }
+                        emit_transcript_value(
+                            &value,
+                            &state,
+                            output_format,
+                            include_partial_messages,
+                        )?;
                         last_activity = Instant::now();
                     }
                 }
@@ -318,6 +364,7 @@ async fn tail_until_complete(
         }
 
         if state.saw_result {
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
@@ -327,6 +374,7 @@ async fn tail_until_complete(
                 std::io::stdout().flush()?;
                 state.apply(&value);
             }
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
@@ -339,6 +387,7 @@ async fn tail_until_complete_stream(
     input: &mut mpsc::Receiver<Value>,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
+    include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     let started = Instant::now();
     let mut last_activity = Instant::now();
@@ -362,10 +411,12 @@ async fn tail_until_complete_stream(
                             .maybe_request_tool_permission(process, input, &value)
                             .await?;
                         state.apply(&value);
-                        if output_format == OutputFormat::StreamJson {
-                            println!("{}", serde_json::to_string(&value)?);
-                            std::io::stdout().flush()?;
-                        }
+                        emit_transcript_value(
+                            &value,
+                            &state,
+                            output_format,
+                            include_partial_messages,
+                        )?;
                         last_activity = Instant::now();
                     }
                 }
@@ -388,6 +439,7 @@ async fn tail_until_complete_stream(
         }
 
         if state.saw_result {
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         if permission.denied_current_turn() && last_activity.elapsed() >= COMPLETION_IDLE {
@@ -397,6 +449,7 @@ async fn tail_until_complete_stream(
                 std::io::stdout().flush()?;
                 state.apply(&value);
             }
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
@@ -406,10 +459,162 @@ async fn tail_until_complete_stream(
                 std::io::stdout().flush()?;
                 state.apply(&value);
             }
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
+}
+
+fn emit_transcript_value(
+    value: &Value,
+    state: &TranscriptState,
+    output_format: OutputFormat,
+    include_partial_messages: bool,
+) -> Result<()> {
+    if output_format != OutputFormat::StreamJson {
+        return Ok(());
+    }
+    if include_partial_messages {
+        for event in synthetic_stream_events_for_assistant(value, state) {
+            println!("{}", serde_json::to_string(&event)?);
+        }
+    }
+    println!("{}", serde_json::to_string(value)?);
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn synthetic_stream_events_for_assistant(value: &Value, state: &TranscriptState) -> Vec<Value> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(text) = assistant_text_from_value(value).filter(|text| !text.is_empty()) else {
+        return Vec::new();
+    };
+    let message = value.get("message").unwrap_or(value);
+    let message_id = message
+        .get("id")
+        .or_else(|| value.get("uuid"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let session_id = value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| state.session_id.clone())
+        .unwrap_or_default();
+    let parent_tool_use_id = value
+        .get("parent_tool_use_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("<synthetic>");
+    let usage = message.get("usage").cloned().unwrap_or_else(zero_usage);
+    let base = |event: Value| {
+        json!({
+            "type": "stream_event",
+            "session_id": session_id,
+            "uuid": Uuid::new_v4().to_string(),
+            "parent_tool_use_id": parent_tool_use_id,
+            "event": event,
+        })
+    };
+
+    vec![
+        base(json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": usage,
+            }
+        })),
+        base(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "text",
+                "text": "",
+            }
+        })),
+        base(json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "text_delta",
+                "text": text,
+            }
+        })),
+        base(json!({
+            "type": "content_block_stop",
+            "index": 0,
+        })),
+        base(json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+            },
+            "usage": usage,
+        })),
+        base(json!({
+            "type": "message_stop",
+        })),
+    ]
+}
+
+fn assistant_text_from_value(value: &Value) -> Option<String> {
+    let message = value.get("message").unwrap_or(value);
+    let content = message.get("content")?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| {
+                    (item.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| item.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
+}
+
+fn emit_idle_session_state_if_requested(
+    state: &mut TranscriptState,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if output_format != OutputFormat::StreamJson
+        || state.saw_idle_session_state
+        || std::env::var("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return Ok(());
+    }
+    let value = json!({
+        "type": "system",
+        "subtype": "session_state_changed",
+        "state": "idle",
+        "session_id": state.session_id.clone().unwrap_or_default(),
+    });
+    println!("{}", serde_json::to_string(&value)?);
+    std::io::stdout().flush()?;
+    state.apply(&value);
+    Ok(())
 }
 
 struct PermissionBridge {
@@ -1033,6 +1238,24 @@ fn output_mentions_tool_result(output: &str, tool_use: &ToolUse) -> bool {
             || output.contains("⎿"))
 }
 
+fn zero_usage() -> Value {
+    json!({
+        "input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 0,
+        "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0,
+        },
+        "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0,
+        },
+        "service_tier": "standard",
+    })
+}
+
 fn synthetic_result(state: &TranscriptState, duration: Duration) -> Value {
     json!({
         "type": "result",
@@ -1043,7 +1266,13 @@ fn synthetic_result(state: &TranscriptState, duration: Duration) -> Value {
         "num_turns": 1,
         "session_id": state.session_id.clone().unwrap_or_default(),
         "result": state.assistant_text,
-        "usage": {},
+        "stop_reason": "end_turn",
+        "usage": zero_usage(),
+        "total_cost_usd": 0.0,
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "completed",
+        "fast_mode_state": "off",
     })
 }
 
@@ -1061,7 +1290,13 @@ fn synthetic_permission_denied_result(state: &TranscriptState, duration: Duratio
         } else {
             state.assistant_text.as_str()
         },
-        "usage": {},
+        "stop_reason": "end_turn",
+        "usage": zero_usage(),
+        "total_cost_usd": 0.0,
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "completed",
+        "fast_mode_state": "off",
     })
 }
 
@@ -1147,6 +1382,7 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
     let started = Instant::now();
     let mut trust_prompt_ack_sent = false;
     let mut startup_choice_ack_sent = false;
+    let mut auto_mode_ack_sent = false;
     loop {
         let output = process.recent_output();
         if tty_output_has_workspace_trust_prompt(&output) && !trust_prompt_ack_sent {
@@ -1158,6 +1394,12 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
         if tty_output_has_startup_choice_prompt(&output) && !startup_choice_ack_sent {
             process.write_all(b"\r")?;
             startup_choice_ack_sent = true;
+            tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
+            continue;
+        }
+        if tty_output_has_auto_mode_consent_prompt(&output) && !auto_mode_ack_sent {
+            process.write_all(b"2\r")?;
+            auto_mode_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
@@ -1194,6 +1436,14 @@ fn tty_output_has_startup_choice_prompt(output: &str) -> bool {
     let output = plain_tty_output(output);
     let compact = compact_tty_output(&output);
     output.contains("Syntax theme:") || compact.contains("Syntaxtheme:")
+}
+
+fn tty_output_has_auto_mode_consent_prompt(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    (output.contains("auto mode") || compact.contains("automode"))
+        && (output.contains("Yes, enable auto mode") || compact.contains("Yes,enableautomode"))
+        && (output.contains("No, exit") || compact.contains("No,exit"))
 }
 
 fn tty_output_accepts_prompt(output: &str) -> bool {
@@ -1476,6 +1726,19 @@ mod tests {
             String::from_utf8(bracketed_paste_input("a\r\nb")).unwrap(),
             "\u{1b}[200~a\nb\u{1b}[201~\r"
         );
+    }
+
+    #[test]
+    fn detects_auto_mode_consent_prompt() {
+        let output = "\
+            Claude can run tools automatically. \
+            Sessions are slightly more expensive. \
+            Shift+Tab to change mode. \
+            ❯ 1. Yes, and make it my default mode \
+              2. Yes, enable auto mode \
+              3. No, exit Enter to confirm";
+
+        assert!(tty_output_has_auto_mode_consent_prompt(output));
     }
 
     #[test]
