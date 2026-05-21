@@ -138,6 +138,25 @@ Claude binary:
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
 
+## Replacement Boundary
+
+`cctty` replaces the `claude` executable used by the Claude Agent SDK and
+`claude -p` style non-interactive flows. It does **not** replace higher-level
+wrappers such as ACP servers, editor adapters, or project-specific agent
+runtimes.
+
+That boundary is intentional:
+
+- If an app exposes `cli_path`, `pathToClaudeCodeExecutable`, or
+  `CLAUDE_CODE_EXECUTABLE`, point that setting at `cctty`.
+- If an app is an ACP adapter, keep the ACP adapter in place and configure its
+  internal Claude executable path to `cctty` when it offers one.
+- If a wrapper hard-codes `claude`, use a PATH shim or ask the wrapper to expose
+  the executable-path option.
+- `cctty --acp --stdio` is not a supported interface. `--acp` is not a current
+  Claude Code CLI option; it belongs to third-party wrappers that sit above
+  Claude Code.
+
 ## TypeScript SDK
 
 Install the official SDK:
@@ -296,6 +315,29 @@ async def main():
 asyncio.run(main())
 ```
 
+## Tested Open-Source Integrations
+
+Surveyed and tested on 2026-05-21. The support target is always the same:
+`cctty` replaces the underlying Claude executable/core, while the host project
+keeps owning its own SDK, ACP, editor, or orchestration protocol.
+
+| Project / package | Integration style | Status | Configure cctty | Tested coverage | Known gaps |
+| --- | --- | --- | --- | --- | --- |
+| `@anthropic-ai/claude-agent-sdk` | Official TypeScript Claude Agent SDK | Supported | `pathToClaudeCodeExecutable: "cctty"` | Deterministic SDK test with fake Claude; live mini-game write test under `permissionMode: "default"` with SDK `canUseTool` approvals; live direct SDK smoke through cctty. | Result metadata is synthesized when interactive Claude does not write a `result` frame. `--include-partial-messages` emits SDK-compatible text events after transcript persistence, not token-by-token partials. |
+| `claude-agent-sdk` | Official Python Claude Agent SDK | Supported | `ClaudeAgentOptions(cli_path="cctty")` | Deterministic SDK test with fake Claude; live mini-game write test under `permission_mode="default"` with SDK `can_use_tool` approvals. | Same result metadata and synthetic partial-message limits as TypeScript. |
+| Hermes Agent | OpenAI-like agent runtime with a Claude SDK provider | Supported on the cctty branch | Select provider `claude-sdk` or alias `cctty`; set `HERMES_CLAUDE_SDK_COMMAND=/path/to/cctty` or `CCTTY_CLI_PATH=/path/to/cctty`. | Hermes unit coverage for provider routing and a local `ClaudeSDKClient` smoke through cctty. `copilot-acp` remains separate. | Upstream release has to include the `claude-sdk` provider path; cctty does not implement Hermes' ACP adapter. |
+| NanoClaw / NanoBot (`qwibitai/nanoclaw`) | Containerized TypeScript Agent SDK runner | Core supported; project integration needs a path override | Its runner passes `pathToClaudeCodeExecutable` to the SDK, but currently hard-codes `/pnpm/claude`. Patch NanoClaw to expose that setting, or install/symlink cctty at `/pnpm/claude` inside the agent image and set `CCTTY_CLAUDE_PATH` to the real Claude binary. | Source inspected at commit `0683c6e` / `nanoclaw@2.0.64`; NanoClaw-pinned `@anthropic-ai/claude-agent-sdk@0.2.138` smoke passed with cctty. | Full container/session runtime not run. Upstream should expose the executable path as config. |
+| `@agentclientprotocol/claude-agent-acp` | ACP server powered by the TypeScript Claude Agent SDK | Supported as a core executable override | Set `CLAUDE_CODE_EXECUTABLE=/path/to/cctty` in the ACP adapter environment. | `0.36.1` smoke passed through `acpx`, including SDK initialization metadata, `includePartialMessages`, and idle session-state handling. | ACP behavior belongs to the adapter. cctty only supplies the Claude executable behind it. Dynamic `set_model` / `set_permission_mode` control requests are compatibility-acknowledged; the underlying TTY run still comes from the CLI args/settings used at launch. |
+| `@zed-industries/claude-code-acp` | Deprecated ACP server powered by the TypeScript Claude Agent SDK | Supported as a core executable override | Set `CLAUDE_CODE_EXECUTABLE=/path/to/cctty` in the ACP adapter environment. | `0.16.2` smoke passed through `acpx`. npm marks this package deprecated in favor of `@agentclientprotocol/claude-agent-acp`. | Same boundary as above: keep the ACP adapter, replace only its Claude executable. |
+| `acp-claude-code` | ACP bridge for Claude Code | Conditional | Set `ACP_PATH_TO_CLAUDE_CODE_EXECUTABLE=/path/to/cctty`. | `0.8.0` path override works. A smoke passed with the older SDK-exporting `@anthropic-ai/claude-code@1.0.128` dependency and fake Claude under cctty. | A fresh install currently resolves `@anthropic-ai/claude-code: latest` to a CLI-only package, so the wrapper can fail before cctty starts. This is a wrapper dependency issue, not an ACP feature cctty should implement. |
+| `claude-code-acp` / `cc-acp` | Alternate ACP bridge for Claude Code | Unsupported without wrapper changes | No cctty setting found. | `0.1.1` source/package inspected. | The wrapper hard-resolves its bundled `@anthropic-ai/claude-code/cli.js` and ignores `CLAUDE_CODE_EXECUTABLE`; it needs an upstream executable-path option. |
+
+Other surveyed SDK hosts generally fit the same rule: if the host exposes
+`cli_path`, `pathToClaudeCodeExecutable`, `CLAUDE_CODE_EXECUTABLE`, or a similar
+Claude executable-path option, point it at `cctty`. If it imports an SDK module
+path, bundles a specific `cli.js`, or manages an interactive terminal itself,
+the host needs a small upstream option before cctty can be selected cleanly.
+
 ## How It Works
 
 Normal interactive commands, `--help`, and `--version` are proxied to the real
@@ -339,6 +381,15 @@ responses against the real interactive Claude TTY:
 CCTTY_LIVE_PERMISSION=1 cargo test --test claude_differential live_permission_prompt_stdio_honors_project_ask_rules -- --ignored --nocapture
 ```
 
+Live permission-mode smoke tests cover `plan`, `auto`, `dontAsk`, and
+`acceptEdits`, including the first-run auto-mode consent form and an
+`acceptEdits` file-write run:
+
+```sh
+CCTTY_LIVE_PERMISSION_MODES=1 cargo test --test claude_differential live_permission_modes_smoke_common_modes -- --ignored --nocapture
+CCTTY_LIVE_PERMISSION_MODES=1 cargo test --test claude_differential live_accept_edits_writes_file_without_sdk_permission_callback -- --ignored --nocapture
+```
+
 Live SDK game tests install the official Python and TypeScript SDKs, run them
 against real `cctty`/Claude, keep `permissionMode` at `default`, approve file
 edits through SDK `can_use_tool` callbacks, and verify that a small browser game
@@ -366,7 +417,7 @@ through the tap.
 
 ## Compatibility Matrix
 
-Captured from `claude --help` on Claude Code `2.1.144`.
+Captured from `claude --help` on Claude Code `2.1.146`.
 
 Status legend:
 
@@ -405,7 +456,7 @@ Status legend:
 | `-h`, `--help` | Supported | Entire command is proxied to real Claude. | Fake proxy test covers `--version`; README coverage test covers both aliases. |
 | `--ide` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--include-hook-events` | Partial | Forwarded. Hook events appear only if interactive transcript writes them; stream semantics are not guaranteed to match `--print`. | Parser coverage only. |
-| `--include-partial-messages` | Unsupported | Consumed by `cctty`; no partial assistant chunks are emitted because transcript tailing only sees persisted messages. | Parser coverage marks it consumed. |
+| `--include-partial-messages` | Partial | Consumed by `cctty`. When transcript text arrives, `cctty` emits SDK-compatible synthetic `stream_event` text deltas before the persisted `assistant` frame so SDK wrappers that render partial messages can work. | Parser coverage plus fake-PTY stream-event test and live `@agentclientprotocol/claude-agent-acp` / `@zed-industries/claude-code-acp` smokes. It is not token-by-token live streaming; chunks arrive after transcript persistence. |
 | `--input-format` | Supported | `text` prompts are read from argv/stdin. `stream-json` SDK input is read from stdin. | Fake-PTY test, Python SDK test, TypeScript SDK test, plus live Python/TypeScript SDK game tests. |
 | `--json-schema` | Partial | Forwarded, but `cctty` synthesizes result frames when interactive transcript lacks one; `structured_output` parity is not proven. | Parser coverage only. Needs structured-output differential. |
 | `--max-budget-usd` | Partial | Forwarded, but Claude documents this as print-only. Underlying interactive behavior is not proven equivalent. | Parser coverage only. |
@@ -416,7 +467,7 @@ Status legend:
 | `--no-chrome` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--no-session-persistence` | Supported | Consumed by `cctty`. The underlying interactive run uses the normal Claude config/auth, then `cctty` removes the generated transcript and empty project directories after the run. | Parser coverage plus fake-PTY persistence cleanup test. This preserves auth better than replacing `CLAUDE_CONFIG_DIR`. |
 | `--output-format` | Partial | `text`, `json`, and `stream-json` are emitted by `cctty`. `stream-json` includes transcript frames plus a synthetic `result` frame if interactive Claude did not write one. | Fake-PTY and live stream-json differential pass. Result metadata is partial. |
-| `--permission-mode` | Partial | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live differential covers `bypassPermissions`; live permission coverage exercises `default` with project-local `permissions.ask` rules for Bash and file writes through Python/TypeScript SDK callbacks. Other modes still need focused live tests. |
+| `--permission-mode` | Supported | Forwarded to interactive Claude for all documented modes: `acceptEdits`, `auto`, `bypassPermissions`, `default`, `dontAsk`, `plan`. The first-run auto-mode consent form is handled by keyboard and chooses "enable auto mode" for the current run, not "make default". SDK permission callbacks are bridged when the caller also supplies hidden `--permission-prompt-tool stdio`. | Parser coverage for all modes plus fake-PTY argv capture for all modes. Live tests cover `plan`, `auto`, `dontAsk`, `acceptEdits`, `bypassPermissions`, and `default` with project-local `permissions.ask` rules. Live SDK game tests exercise file-write approvals through Python and TypeScript SDK callbacks. |
 | `--plugin-dir` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `--plugin-url` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. |
 | `-p`, `--print` | Supported | Consumed by `cctty`; underlying Claude is intentionally launched interactively through a PTY. | Fake-PTY and live differential pass for basic query. |
@@ -450,12 +501,20 @@ Some SDKs pass flags that are not listed in current `claude --help`.
 
 - Permission callbacks now have fake-PTY allow/deny coverage, a live
   `Bash(printf:*)` approval differential for both allow and deny, and live
-  Python/TypeScript SDK coverage for file creation approvals. Remaining risk is
-  breadth: more `Edit`/`MultiEdit` TTY variants, `allowedTools`/`disallowedTools`
+  Python/TypeScript SDK coverage for file creation approvals. Permission modes
+  `plan`, `auto`, `dontAsk`, `acceptEdits`, `bypassPermissions`, and `default`
+  have focused live coverage. Remaining risk is breadth: more
+  `Edit`/`MultiEdit` TTY variants, `allowedTools`/`disallowedTools`
   interactions, and exact SDK metadata fields still need live coverage.
-- `--include-partial-messages` is not implemented because transcript tailing does
-  not expose partial assistant chunks.
+- `--include-partial-messages` is compatibility-oriented, not true token-level
+  streaming. cctty emits synthetic text deltas once transcript text is
+  persisted; this unblocks SDK wrappers, but does not perfectly match Claude
+  Code's live partial timing.
 - `--json-schema`, `--max-budget-usd`, and `--fallback-model` need focused live
   differentials before being marked supported.
-- SDK control requests beyond `initialize` and `interrupt` are currently
-  reported as unsupported rather than silently faked.
+- SDK control requests used by popular wrappers are compatibility-acked:
+  `initialize`, `interrupt`, `set_model`, `set_permission_mode`,
+  `set_max_thinking_tokens`, `apply_flag_settings`, and `mcp_status`. Dynamic
+  model/mode changes after a TTY session is already running are still partial;
+  the actual Claude process behavior comes from its launch args and local
+  settings.

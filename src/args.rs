@@ -33,6 +33,7 @@ pub struct Invocation {
     pub continue_conversation: bool,
     pub no_session_persistence: bool,
     pub permission_prompt_tool_stdio: bool,
+    pub include_partial_messages: bool,
 }
 
 impl Invocation {
@@ -55,6 +56,7 @@ impl Invocation {
         let mut continue_conversation = false;
         let mut no_session_persistence = false;
         let mut permission_prompt_tool_stdio = false;
+        let mut include_partial_messages = false;
 
         let mut index = 0;
         while index < args.len() {
@@ -93,7 +95,12 @@ impl Invocation {
                 index += 2;
                 continue;
             }
-            if arg == "--include-partial-messages" || arg == "--replay-user-messages" {
+            if arg == "--include-partial-messages" {
+                include_partial_messages = true;
+                index += 1;
+                continue;
+            }
+            if arg == "--replay-user-messages" {
                 index += 1;
                 continue;
             }
@@ -236,6 +243,7 @@ impl Invocation {
             continue_conversation,
             no_session_persistence,
             permission_prompt_tool_stdio,
+            include_partial_messages,
         })
     }
 
@@ -251,6 +259,7 @@ impl Invocation {
             continue_conversation: false,
             no_session_persistence: false,
             permission_prompt_tool_stdio: false,
+            include_partial_messages: false,
         }
     }
 }
@@ -582,6 +591,27 @@ mod tests {
                 .passthrough_args
                 .iter()
                 .any(|arg| arg == "--no-session-persistence")
+        );
+    }
+
+    #[test]
+    fn parse_tracks_include_partial_messages_without_forwarding_it() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "--input-format".to_owned(),
+            "stream-json".to_owned(),
+            "--output-format".to_owned(),
+            "stream-json".to_owned(),
+            "--include-partial-messages".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(invocation.include_partial_messages);
+        assert!(
+            !invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
         );
     }
 

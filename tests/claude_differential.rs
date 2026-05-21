@@ -90,6 +90,97 @@ fn live_permission_prompt_stdio_honors_project_ask_rules() {
     assert_eq!(denied.result["result"], "Permission denied");
 }
 
+#[test]
+#[ignore = "requires real Claude CLI auth and spends real Claude calls"]
+fn live_permission_modes_smoke_common_modes() {
+    if std::env::var("CCTTY_LIVE_PERMISSION_MODES").ok().as_deref() != Some("1") {
+        eprintln!("set CCTTY_LIVE_PERMISSION_MODES=1 to run live permission-mode smoke tests");
+        return;
+    }
+
+    for (mode, token, prompt) in [
+        (
+            "plan",
+            "CCTTY_PLAN_MODE_OK",
+            "In plan mode, write a short implementation plan and include CCTTY_PLAN_MODE_OK. Do not use tools.",
+        ),
+        (
+            "auto",
+            "CCTTY_AUTO_MODE_OK",
+            "Reply exactly CCTTY_AUTO_MODE_OK and use no tools.",
+        ),
+        (
+            "dontAsk",
+            "CCTTY_DONTASK_MODE_OK",
+            "Reply exactly CCTTY_DONTASK_MODE_OK and use no tools.",
+        ),
+        (
+            "acceptEdits",
+            "CCTTY_ACCEPT_EDITS_MODE_OK",
+            "Reply exactly CCTTY_ACCEPT_EDITS_MODE_OK and use no tools.",
+        ),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let output = run_jsonl(
+            env!("CARGO_BIN_EXE_cctty"),
+            workspace.path(),
+            &[
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--input-format",
+                "text",
+                "--permission-mode",
+                mode,
+                "--max-turns",
+                "1",
+                "--no-chrome",
+                prompt,
+            ],
+        );
+        assert!(has_type(&output, "assistant"), "{mode} output: {output:?}");
+        assert!(has_type(&output, "result"), "{mode} output: {output:?}");
+        assert!(
+            assistant_text(&output).contains(token),
+            "{mode} output: {output:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires real Claude CLI auth and spends real Claude calls"]
+fn live_accept_edits_writes_file_without_sdk_permission_callback() {
+    if std::env::var("CCTTY_LIVE_PERMISSION_MODES").ok().as_deref() != Some("1") {
+        eprintln!("set CCTTY_LIVE_PERMISSION_MODES=1 to run live permission-mode smoke tests");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run_jsonl(
+        env!("CARGO_BIN_EXE_cctty"),
+        workspace.path(),
+        &[
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "text",
+            "--permission-mode",
+            "acceptEdits",
+            "--max-turns",
+            "4",
+            "--no-chrome",
+            "Create a file named cctty_accept_edits.txt containing exactly CCTTY_ACCEPT_EDITS_FILE_OK. Do not create any other files.",
+        ],
+    );
+    assert!(has_type(&output, "result"), "output: {output:?}");
+    let written = std::fs::read_to_string(workspace.path().join("cctty_accept_edits.txt"))
+        .unwrap_or_else(|error| panic!("missing acceptEdits output file: {error}\n{output:?}"));
+    assert!(written.contains("CCTTY_ACCEPT_EDITS_FILE_OK"));
+}
+
 struct LivePermissionOutcome {
     request: Value,
     result: Value,

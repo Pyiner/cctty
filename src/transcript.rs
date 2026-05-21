@@ -12,6 +12,7 @@ pub struct TranscriptState {
     pub result: Option<Value>,
     pub saw_result: bool,
     pub saw_assistant: bool,
+    pub saw_idle_session_state: bool,
 }
 
 impl TranscriptState {
@@ -23,6 +24,11 @@ impl TranscriptState {
             Some("system") => {
                 if self.session_id.is_none() {
                     self.session_id = session_id(value);
+                }
+                if value.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
+                    && value.get("state").and_then(Value::as_str) == Some("idle")
+                {
+                    self.saw_idle_session_state = true;
                 }
             }
             Some("assistant") => {
