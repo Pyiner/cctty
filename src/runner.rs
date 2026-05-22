@@ -314,7 +314,7 @@ async fn submit_prompt_and_tail(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    process.write_all(&bracketed_paste_input(prompt))?;
+    submit_prompt_to_tty(process, prompt).await?;
     tail_until_complete(process, tail, output_format, include_partial_messages).await
 }
 
@@ -328,7 +328,7 @@ async fn submit_prompt_and_tail_stream(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    process.write_all(&bracketed_paste_input(prompt))?;
+    submit_prompt_to_tty(process, prompt).await?;
     tail_until_complete_stream(
         process,
         tail,
@@ -338,6 +338,16 @@ async fn submit_prompt_and_tail_stream(
         include_partial_messages,
     )
     .await
+}
+
+async fn submit_prompt_to_tty(process: &mut PtyProcess, prompt: &str) -> Result<()> {
+    process.write_all(&bracketed_paste_input(prompt))?;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
+        logging::event("prompt_submit_retry reason=prompt_still_visible");
+        process.write_all(b"\r")?;
+    }
+    Ok(())
 }
 
 async fn tail_until_complete(
@@ -470,12 +480,12 @@ async fn tail_until_complete_stream(
         {
             last_activity = Instant::now();
         }
-        if !permission_prompt_tool_stdio
-            && !permission.handled_ask_user_question()
+        if !permission.handled_ask_user_question()
             && questions
                 .maybe_handle_tty_question(process, Some(input))
                 .await?
         {
+            permission.mark_ask_user_question_handled();
             last_activity = Instant::now();
         }
 
@@ -848,6 +858,9 @@ impl PermissionBridge {
     }
 
     fn has_handled_tool(&self, tool_use: &ToolUse) -> bool {
+        if tool_use.name == "AskUserQuestion" && self.handled_ask_user_question {
+            return true;
+        }
         let key = ToolKey::from(tool_use);
         self.handled_tool_keys
             .iter()
@@ -864,6 +877,10 @@ impl PermissionBridge {
 
     fn handled_ask_user_question(&self) -> bool {
         self.handled_ask_user_question
+    }
+
+    fn mark_ask_user_question_handled(&mut self) {
+        self.handled_ask_user_question = true;
     }
 
     fn pending_tty_permission_matches(&self, tool_use: &ToolUse) -> bool {
@@ -1620,10 +1637,16 @@ fn default_question_decline_feedback() -> &'static str {
 
 async fn cancel_tty_question(process: &mut PtyProcess, feedback: Option<&str>) -> Result<()> {
     process.write_all(b"\x1b")?;
-    if let Some(feedback) = feedback
-        && wait_for_tty_question_feedback_prompt(process).await
-    {
-        process.write_all(&bracketed_paste_input(feedback))?;
+    if let Some(feedback) = feedback {
+        match wait_for_tty_question_feedback_target(process).await {
+            Some(QuestionFeedbackTarget::FeedbackPrompt) => {
+                process.write_all(&bracketed_paste_input(feedback))?;
+            }
+            Some(QuestionFeedbackTarget::MainPrompt) => {
+                submit_prompt_to_tty(process, feedback).await?;
+            }
+            None => {}
+        }
     }
     tokio::time::sleep(TTY_READY_SETTLE).await;
     Ok(())
@@ -1804,16 +1827,32 @@ async fn wait_for_tty_permission_feedback_prompt(process: &PtyProcess) -> bool {
     false
 }
 
-async fn wait_for_tty_question_feedback_prompt(process: &PtyProcess) -> bool {
+enum QuestionFeedbackTarget {
+    FeedbackPrompt,
+    MainPrompt,
+}
+
+async fn wait_for_tty_question_feedback_target(
+    process: &PtyProcess,
+) -> Option<QuestionFeedbackTarget> {
     let started = Instant::now();
     while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
         let output = process.recent_output();
         if tty_output_has_question_feedback_prompt(&output) {
-            return true;
+            return Some(QuestionFeedbackTarget::FeedbackPrompt);
+        }
+        let plain = plain_tty_output(&output);
+        let question_was_dismissed = plain.contains("User declined to answer questions")
+            || plain.contains("declined to answer questions")
+            || plain.contains("declined to answer");
+        if (question_was_dismissed || tty_question_from_form(&plain).is_none())
+            && tty_output_accepts_prompt(&plain)
+        {
+            return Some(QuestionFeedbackTarget::MainPrompt);
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
-    false
+    None
 }
 
 async fn wait_for_tty_question_form(process: &PtyProcess) -> bool {
@@ -2144,6 +2183,30 @@ fn tty_output_accepts_prompt(output: &str) -> bool {
         || (has_prompt_marker && has_status)
 }
 
+fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
+    if !tty_output_accepts_prompt(output) {
+        return false;
+    }
+    let plain = plain_tty_output(output);
+    if tty_question_from_form(&plain).is_some()
+        || plain_tty_output_has_permission_prompt_for_tool(&plain, "Bash")
+        || plain_tty_output_has_file_permission_prompt(&plain)
+    {
+        return false;
+    }
+    let prompt = compact_tty_output(prompt);
+    if prompt.is_empty() {
+        return false;
+    }
+    let tail = prompt
+        .char_indices()
+        .rev()
+        .nth(31)
+        .map(|(index, _)| &prompt[index..])
+        .unwrap_or(prompt.as_str());
+    compact_tty_output(&plain).contains(tail)
+}
+
 fn compact_tty_output(output: &str) -> String {
     output.split_whitespace().collect()
 }
@@ -2456,6 +2519,25 @@ mod tests {
             String::from_utf8(bracketed_paste_input("a\r\nb")).unwrap(),
             "\u{1b}[200~a\nb\u{1b}[201~\r"
         );
+    }
+
+    #[test]
+    fn detects_prompt_left_in_tty_input() {
+        let output = "❯ Write a compact document for SDK users\nContext 0% /mcp";
+        assert!(tty_output_still_editing_prompt(
+            output,
+            "Write a compact document for SDK users"
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_submit_on_permission_prompt() {
+        let output =
+            "Bash command echo test\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel";
+        assert!(!tty_output_still_editing_prompt(
+            output,
+            "Write a compact document for SDK users"
+        ));
     }
 
     #[test]
