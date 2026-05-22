@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::args::{CommandMode, InputFormat, Invocation, OutputFormat};
 use crate::error::{CcttyError, Result};
+use crate::logging;
 use crate::pty::{PtyProcess, PtySpawnSpec};
 use crate::transcript::{TranscriptState, claude_config_dir, read_complete_lines, transcript_path};
 
@@ -21,6 +22,7 @@ const TTY_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const TTY_READY_SETTLE: Duration = Duration::from_millis(250);
 const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_PERMISSION_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
+const TTY_QUESTION_FORM_SETTLE: Duration = Duration::from_millis(250);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -32,6 +34,11 @@ pub async fn run(invocation: Invocation) -> Result<i32> {
 
 async fn run_passthrough(invocation: &Invocation) -> Result<i32> {
     let claude = resolve_claude_path()?;
+    logging::event(format!(
+        "passthrough_spawn claude={} args={}",
+        claude,
+        invocation.passthrough_args.len()
+    ));
     let mut child = tokio::process::Command::new(claude)
         .args(&invocation.passthrough_args)
         .stdin(Stdio::inherit())
@@ -39,7 +46,9 @@ async fn run_passthrough(invocation: &Invocation) -> Result<i32> {
         .stderr(Stdio::inherit())
         .spawn()?;
     let status = child.wait().await?;
-    Ok(status.code().unwrap_or(1))
+    let code = status.code().unwrap_or(1);
+    logging::event(format!("passthrough_exit exit_code={code}"));
+    Ok(code)
 }
 
 async fn run_print(invocation: Invocation) -> Result<i32> {
@@ -59,6 +68,16 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             .map(|session_id| transcript_path(&config_dir, &cwd, session_id))
     };
     let env = interactive_claude_env();
+    logging::event(format!(
+        "tty_spawn claude={} cwd={} session_id={} input={:?} output={:?} permission_prompt_stdio={} include_partial_messages={}",
+        claude,
+        cwd.display(),
+        session_id.as_deref().unwrap_or(""),
+        invocation.input_format,
+        invocation.output_format,
+        invocation.permission_prompt_tool_stdio,
+        invocation.include_partial_messages
+    ));
 
     let mut process = PtyProcess::spawn(&PtySpawnSpec {
         command: claude,
@@ -69,7 +88,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
     })?;
     prepare_tty_for_prompt(&mut process).await?;
 
-    let mut tail = TailCursor::new(transcript, &config_dir)?;
+    let mut tail = TailCursor::new(transcript, &config_dir, invocation.continue_conversation)?;
 
     match invocation.input_format {
         InputFormat::Text => {
@@ -233,6 +252,7 @@ fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()>
             format!("Unsupported control request: {subtype}"),
         ),
     };
+    logging::event(format!("control_request subtype={subtype}"));
     println!("{}", serde_json::to_string(&response)?);
     std::io::stdout().flush()?;
     Ok(())
@@ -295,7 +315,7 @@ async fn submit_prompt_and_tail(
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
     process.write_all(&bracketed_paste_input(prompt))?;
-    tail_until_complete(tail, output_format, include_partial_messages).await
+    tail_until_complete(process, tail, output_format, include_partial_messages).await
 }
 
 async fn submit_prompt_and_tail_stream(
@@ -321,6 +341,7 @@ async fn submit_prompt_and_tail_stream(
 }
 
 async fn tail_until_complete(
+    process: &mut PtyProcess,
     tail: &mut TailCursor,
     output_format: OutputFormat,
     include_partial_messages: bool,
@@ -328,9 +349,12 @@ async fn tail_until_complete(
     let started = Instant::now();
     let mut last_activity = Instant::now();
     let mut state = TranscriptState::default();
+    let mut tty_debug = TtyDebugLogger::new("text");
+    let mut questions = TtyQuestionBridge::new(false);
 
     loop {
         if started.elapsed() > RUN_TIMEOUT {
+            logging::event("tail_timeout stream=false");
             return Err(CcttyError::Timeout(
                 "timed out waiting for Claude transcript".to_owned(),
             ));
@@ -364,12 +388,17 @@ async fn tail_until_complete(
         }
 
         if state.saw_result {
+            logging::event("tail_result source=transcript");
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
+        }
+        if questions.maybe_handle_tty_question(process, None).await? {
+            last_activity = Instant::now();
         }
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
             if output_format == OutputFormat::StreamJson && !state.saw_result {
                 let value = synthetic_result(&state, started.elapsed());
+                logging::event("tail_result source=synthetic");
                 println!("{}", serde_json::to_string(&value)?);
                 std::io::stdout().flush()?;
                 state.apply(&value);
@@ -377,6 +406,7 @@ async fn tail_until_complete(
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
+        tty_debug.maybe_log(process, started.elapsed());
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
 }
@@ -393,9 +423,12 @@ async fn tail_until_complete_stream(
     let mut last_activity = Instant::now();
     let mut state = TranscriptState::default();
     let mut permission = PermissionBridge::new(permission_prompt_tool_stdio);
+    let mut questions = TtyQuestionBridge::new(permission_prompt_tool_stdio);
+    let mut tty_debug = TtyDebugLogger::new("stream");
 
     loop {
         if started.elapsed() > RUN_TIMEOUT {
+            logging::event("tail_timeout stream=true");
             return Err(CcttyError::Timeout(
                 "timed out waiting for Claude transcript".to_owned(),
             ));
@@ -437,14 +470,24 @@ async fn tail_until_complete_stream(
         {
             last_activity = Instant::now();
         }
+        if !permission_prompt_tool_stdio
+            && !permission.handled_ask_user_question()
+            && questions
+                .maybe_handle_tty_question(process, Some(input))
+                .await?
+        {
+            last_activity = Instant::now();
+        }
 
         if state.saw_result {
+            logging::event("tail_result source=transcript stream=true");
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
         if permission.denied_current_turn() && last_activity.elapsed() >= COMPLETION_IDLE {
             if output_format == OutputFormat::StreamJson && !state.saw_result {
                 let value = synthetic_permission_denied_result(&state, started.elapsed());
+                logging::event("tail_result source=synthetic_permission_denied");
                 println!("{}", serde_json::to_string(&value)?);
                 std::io::stdout().flush()?;
                 state.apply(&value);
@@ -455,6 +498,7 @@ async fn tail_until_complete_stream(
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
             if output_format == OutputFormat::StreamJson && !state.saw_result {
                 let value = synthetic_result(&state, started.elapsed());
+                logging::event("tail_result source=synthetic stream=true");
                 println!("{}", serde_json::to_string(&value)?);
                 std::io::stdout().flush()?;
                 state.apply(&value);
@@ -462,6 +506,7 @@ async fn tail_until_complete_stream(
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
+        tty_debug.maybe_log(process, started.elapsed());
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
 }
@@ -611,10 +656,47 @@ fn emit_idle_session_state_if_requested(
         "state": "idle",
         "session_id": state.session_id.clone().unwrap_or_default(),
     });
+    logging::event("session_state state=idle source=synthetic");
     println!("{}", serde_json::to_string(&value)?);
     std::io::stdout().flush()?;
     state.apply(&value);
     Ok(())
+}
+
+struct TtyDebugLogger {
+    enabled: bool,
+    stage: &'static str,
+    last_recent: String,
+    next_log: Instant,
+}
+
+impl TtyDebugLogger {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            enabled: std::env::var("CCTTY_LOG_TTY").ok().as_deref() == Some("1"),
+            stage,
+            last_recent: String::new(),
+            next_log: Instant::now() + Duration::from_secs(3),
+        }
+    }
+
+    fn maybe_log(&mut self, process: &PtyProcess, elapsed: Duration) {
+        if !self.enabled || Instant::now() < self.next_log {
+            return;
+        }
+        self.next_log = Instant::now() + Duration::from_secs(3);
+        let recent = recent_tty_log_text(&process.recent_output(), 1_500);
+        if recent.is_empty() || recent == self.last_recent {
+            return;
+        }
+        self.last_recent = recent.clone();
+        logging::event(format!(
+            "tty_recent stage={} elapsed_ms={} text={}",
+            self.stage,
+            elapsed.as_millis(),
+            single_line_log_text(&recent)
+        ));
+    }
 }
 
 struct PermissionBridge {
@@ -623,6 +705,7 @@ struct PermissionBridge {
     handled_tool_keys: Vec<ToolKey>,
     pending_tty_permission: Option<PendingTtyPermission>,
     denied_current_turn: bool,
+    handled_ask_user_question: bool,
     next_request: u64,
 }
 
@@ -634,6 +717,7 @@ impl PermissionBridge {
             handled_tool_keys: Vec::new(),
             pending_tty_permission: None,
             denied_current_turn: false,
+            handled_ask_user_question: false,
             next_request: 0,
         }
     }
@@ -710,6 +794,9 @@ impl PermissionBridge {
             }
             requested = true;
             self.mark_tool_handled(&tool_use);
+            if tool_use.name == "AskUserQuestion" {
+                self.handled_ask_user_question = true;
+            }
             if self.pending_tty_permission_matches(&tool_use) {
                 self.pending_tty_permission = None;
             }
@@ -738,11 +825,24 @@ impl PermissionBridge {
                 "tool_use_id": tool_use.id,
             }
         });
+        logging::event(format!(
+            "permission_request tool={} tool_use_id={}",
+            tool_use.name, tool_use.id
+        ));
         println!("{}", serde_json::to_string(&request)?);
         std::io::stdout().flush()?;
         let response = wait_for_control_response(input, &request_id).await?;
         if apply_permission_decision(process, tool_use, &response).await? {
             self.denied_current_turn = true;
+            logging::event(format!(
+                "permission_response tool={} behavior=deny",
+                tool_use.name
+            ));
+        } else {
+            logging::event(format!(
+                "permission_response tool={} behavior=allow",
+                tool_use.name
+            ));
         }
         Ok(())
     }
@@ -762,6 +862,10 @@ impl PermissionBridge {
         self.denied_current_turn
     }
 
+    fn handled_ask_user_question(&self) -> bool {
+        self.handled_ask_user_question
+    }
+
     fn pending_tty_permission_matches(&self, tool_use: &ToolUse) -> bool {
         self.pending_tty_permission
             .as_ref()
@@ -773,9 +877,129 @@ impl PermissionBridge {
     }
 }
 
+struct TtyQuestionBridge {
+    enabled: bool,
+    handled_questions: HashSet<String>,
+    pending: Option<PendingTtyQuestion>,
+    next_request: u64,
+}
+
+impl TtyQuestionBridge {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            handled_questions: HashSet::new(),
+            pending: None,
+            next_request: 0,
+        }
+    }
+
+    async fn maybe_handle_tty_question(
+        &mut self,
+        process: &mut PtyProcess,
+        input: Option<&mut mpsc::Receiver<Value>>,
+    ) -> Result<bool> {
+        let Some(question) = tty_question_from_form(&process.recent_output()) else {
+            self.pending = None;
+            return Ok(false);
+        };
+        if self.handled_questions.contains(&question.question) {
+            return Ok(false);
+        }
+        let should_handle = if let Some(pending) = &mut self.pending {
+            if pending.question.question == question.question {
+                pending.question = question;
+                pending.first_seen.elapsed() >= TTY_QUESTION_FORM_SETTLE
+            } else {
+                *pending = PendingTtyQuestion {
+                    question,
+                    first_seen: Instant::now(),
+                };
+                false
+            }
+        } else {
+            self.pending = Some(PendingTtyQuestion {
+                question,
+                first_seen: Instant::now(),
+            });
+            false
+        };
+        if !should_handle {
+            return Ok(false);
+        }
+        let question = self
+            .pending
+            .take()
+            .expect("pending TTY question exists after grace")
+            .question;
+        self.handled_questions.insert(question.question.clone());
+        if !self.enabled {
+            logging::event(format!(
+                "question_response question={} behavior=cancel source=auto",
+                single_line_log_text(&question.question)
+            ));
+            cancel_tty_question(process, Some(default_question_decline_feedback())).await?;
+            return Ok(true);
+        }
+        let Some(input) = input else {
+            return Ok(false);
+        };
+        self.request_question(process, input, question).await?;
+        Ok(true)
+    }
+
+    async fn request_question(
+        &mut self,
+        process: &mut PtyProcess,
+        input: &mut mpsc::Receiver<Value>,
+        question: TtyQuestion,
+    ) -> Result<()> {
+        let request_id = format!("cctty_question_{}", self.next_request);
+        self.next_request += 1;
+        let tool_use = ToolUse {
+            id: request_id.clone(),
+            name: "AskUserQuestion".to_owned(),
+            input: question.to_tool_input(),
+        };
+        let request = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": tool_use.name,
+                "input": tool_use.input,
+                "permission_suggestions": null,
+                "blocked_path": null,
+                "tool_use_id": tool_use.id,
+                "description": question.question,
+            }
+        });
+        logging::event(format!(
+            "question_request question={} options={}",
+            single_line_log_text(&question.question),
+            question
+                .options
+                .iter()
+                .filter(|option| !option.special)
+                .count()
+        ));
+        println!("{}", serde_json::to_string(&request)?);
+        std::io::stdout().flush()?;
+        let response = wait_for_control_response(input, &tool_use.id).await?;
+        apply_question_decision(process, &question, &response).await?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct PendingTtyPermission {
     tool_use: ToolUse,
+    first_seen: Instant,
+}
+
+#[derive(Debug)]
+struct PendingTtyQuestion {
+    question: TtyQuestion,
     first_seen: Instant,
 }
 
@@ -792,6 +1016,46 @@ struct ToolKey {
     command: Option<String>,
     file_path: Option<String>,
     input: String,
+}
+
+#[derive(Debug, Clone)]
+struct TtyQuestion {
+    question: String,
+    header: String,
+    options: Vec<TtyQuestionOption>,
+}
+
+impl TtyQuestion {
+    fn to_tool_input(&self) -> Value {
+        let options = self
+            .options
+            .iter()
+            .filter(|option| !option.special)
+            .map(|option| {
+                json!({
+                    "label": option.label,
+                    "description": option.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "questions": [
+                {
+                    "question": self.question,
+                    "header": self.header,
+                    "options": options,
+                    "multiSelect": false,
+                }
+            ]
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TtyQuestionOption {
+    label: String,
+    description: String,
+    special: bool,
 }
 
 impl ToolKey {
@@ -829,6 +1093,109 @@ impl ToolKey {
             _ => self.input == other.input,
         }
     }
+}
+
+fn tty_question_from_form(output: &str) -> Option<TtyQuestion> {
+    let plain = plain_tty_output(output);
+    if !(plain.contains("Enter to select")
+        && plain.contains("Esc to cancel")
+        && plain.contains("Type something"))
+    {
+        return None;
+    }
+    let form = plain
+        .rsplit_once("✔ Submit →")
+        .map(|(_, after)| after)
+        .unwrap_or(&plain);
+    let option_start = form.find("❯ 1. ").or_else(|| form.find("1. "))?;
+    let question = form[..option_start].trim();
+    if question.is_empty() {
+        return None;
+    }
+    let options = numbered_question_options(&form[option_start..]);
+    if options.iter().filter(|option| !option.special).count() < 2 {
+        return None;
+    }
+    Some(TtyQuestion {
+        question: question.to_owned(),
+        header: tty_question_header(&plain).unwrap_or_else(|| short_header(question)),
+        options,
+    })
+}
+
+fn tty_question_header(plain: &str) -> Option<String> {
+    let before_submit = plain.rsplit_once("✔ Submit →")?.0;
+    before_submit
+        .rsplit_once('☐')
+        .map(|(_, header)| header.trim())
+        .filter(|header| !header.is_empty())
+        .map(short_header)
+}
+
+fn short_header(text: &str) -> String {
+    let mut header = text.chars().take(12).collect::<String>().trim().to_owned();
+    if header.is_empty() {
+        header = "Question".to_owned();
+    }
+    header
+}
+
+fn numbered_question_options(text: &str) -> Vec<TtyQuestionOption> {
+    let mut markers = Vec::new();
+    for index in 1..=9 {
+        let marker = format!("{index}. ");
+        if let Some(pos) = text.find(&marker) {
+            markers.push((index, pos + marker.len()));
+        }
+    }
+    markers.sort_by_key(|(_, pos)| *pos);
+    let mut options = Vec::new();
+    for (marker_index, (_, start)) in markers.iter().enumerate() {
+        let end = markers
+            .get(marker_index + 1)
+            .map(|(_, pos)| pos.saturating_sub(3))
+            .unwrap_or(text.len());
+        let Some(raw) = text.get(*start..end) else {
+            continue;
+        };
+        let value = trim_tty_option_text(raw);
+        if value.is_empty() {
+            continue;
+        }
+        let special = value.eq_ignore_ascii_case("type something")
+            || value.eq_ignore_ascii_case("type something.")
+            || value.eq_ignore_ascii_case("chat about this");
+        let (label, description) = split_question_option(&value);
+        options.push(TtyQuestionOption {
+            label,
+            description,
+            special,
+        });
+    }
+    options
+}
+
+fn trim_tty_option_text(raw: &str) -> String {
+    raw.split("Enter to select")
+        .next()
+        .unwrap_or(raw)
+        .split('─')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches('.')
+        .trim()
+        .to_owned()
+}
+
+fn split_question_option(value: &str) -> (String, String) {
+    let words = value.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= 3 {
+        return (value.to_owned(), String::new());
+    }
+    let label = words.iter().take(3).copied().collect::<Vec<_>>().join(" ");
+    let description = words.iter().skip(3).copied().collect::<Vec<_>>().join(" ");
+    (label, description)
 }
 
 fn is_file_tool(name: &str) -> bool {
@@ -1097,6 +1464,9 @@ async fn apply_permission_decision(
     tool_use: &ToolUse,
     control_response: &Value,
 ) -> Result<bool> {
+    if tool_use.name == "AskUserQuestion" {
+        return apply_ask_user_question_decision(process, tool_use, control_response).await;
+    }
     let behavior = permission_behavior(control_response)
         .unwrap_or_else(|| "allow".to_owned())
         .to_ascii_lowercase();
@@ -1120,6 +1490,281 @@ async fn apply_permission_decision(
         process.write_all(b"\r")?;
     }
     Ok(denied)
+}
+
+async fn apply_ask_user_question_decision(
+    process: &mut PtyProcess,
+    tool_use: &ToolUse,
+    control_response: &Value,
+) -> Result<bool> {
+    let behavior = permission_behavior(control_response)
+        .unwrap_or_else(|| "allow".to_owned())
+        .to_ascii_lowercase();
+    let denied = behavior == "deny";
+    let feedback = if denied {
+        permission_deny_message(control_response)
+            .unwrap_or_else(|| default_question_decline_feedback().to_owned())
+    } else {
+        ask_user_question_feedback_from_response(control_response, tool_use)
+            .unwrap_or_else(|| "用户已经回答了表单，请根据已有回答继续。".to_owned())
+    };
+    let _ = wait_for_tty_question_form(process).await;
+    cancel_tty_question(process, Some(&feedback)).await?;
+    Ok(denied)
+}
+
+fn ask_user_question_feedback_from_response(
+    control_response: &Value,
+    tool_use: &ToolUse,
+) -> Option<String> {
+    let body = control_response
+        .get("response")
+        .and_then(|response| response.get("response"))?;
+    for candidate in question_answer_candidates(body) {
+        if let Some(feedback) = feedback_from_answers(candidate.get("answers")) {
+            return Some(feedback);
+        }
+        if let Some(feedback) = feedback_from_answers(candidate.get("content")) {
+            return Some(feedback);
+        }
+    }
+    ask_user_question_default_feedback(&tool_use.input)
+}
+
+fn ask_user_question_default_feedback(input: &Value) -> Option<String> {
+    let questions = input.get("questions")?.as_array()?;
+    let rendered = questions
+        .iter()
+        .filter_map(|question| {
+            let question_text = question.get("question").and_then(Value::as_str)?;
+            let first_option = question
+                .get("options")
+                .and_then(Value::as_array)
+                .and_then(|options| options.first())
+                .and_then(|option| option.get("label"))
+                .and_then(Value::as_str)
+                .unwrap_or("默认选择");
+            Some(format!("- {question_text}: {first_option}"))
+        })
+        .collect::<Vec<_>>();
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(format!("用户表单回答：\n{}", rendered.join("\n")))
+    }
+}
+
+async fn apply_question_decision(
+    process: &mut PtyProcess,
+    question: &TtyQuestion,
+    control_response: &Value,
+) -> Result<bool> {
+    let behavior = question_response_behavior(control_response);
+    let denied = matches!(behavior.as_str(), "deny" | "decline" | "cancel" | "error");
+    if denied {
+        logging::event(format!(
+            "question_response question={} behavior={behavior}",
+            single_line_log_text(&question.question)
+        ));
+        cancel_tty_question(
+            process,
+            question_deny_message(control_response)
+                .as_deref()
+                .or_else(|| Some(default_question_decline_feedback())),
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    let feedback = question_feedback_from_response(control_response, question)
+        .unwrap_or_else(|| default_question_answer_feedback(question));
+    logging::event(format!(
+        "question_response question={} behavior=allow feedback={}",
+        single_line_log_text(&question.question),
+        single_line_log_text(&feedback)
+    ));
+    cancel_tty_question(process, Some(&feedback)).await?;
+    Ok(false)
+}
+
+fn question_response_behavior(control_response: &Value) -> String {
+    if control_response
+        .get("response")
+        .and_then(|response| response.get("subtype"))
+        .and_then(Value::as_str)
+        == Some("error")
+    {
+        return "error".to_owned();
+    }
+    control_response
+        .get("response")
+        .and_then(|response| response.get("response"))
+        .and_then(|response| {
+            response
+                .get("behavior")
+                .or_else(|| response.get("decision"))
+                .or_else(|| response.get("action"))
+        })
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "allow".to_owned())
+}
+
+fn question_deny_message(control_response: &Value) -> Option<String> {
+    permission_deny_message(control_response)
+}
+
+fn default_question_decline_feedback() -> &'static str {
+    "请不要使用表单，改用普通文字继续。"
+}
+
+async fn cancel_tty_question(process: &mut PtyProcess, feedback: Option<&str>) -> Result<()> {
+    process.write_all(b"\x1b")?;
+    if let Some(feedback) = feedback
+        && wait_for_tty_question_feedback_prompt(process).await
+    {
+        process.write_all(&bracketed_paste_input(feedback))?;
+    }
+    tokio::time::sleep(TTY_READY_SETTLE).await;
+    Ok(())
+}
+
+fn question_feedback_from_response(
+    control_response: &Value,
+    question: &TtyQuestion,
+) -> Option<String> {
+    let body = control_response
+        .get("response")
+        .and_then(|response| response.get("response"))?;
+    for candidate in question_answer_candidates(body) {
+        if let Some(feedback) = feedback_from_answers(candidate.get("answers")) {
+            return Some(feedback);
+        }
+        if let Some(feedback) = feedback_from_answers(candidate.get("content")) {
+            return Some(feedback);
+        }
+        if let Some(answer) = candidate
+            .get("answer")
+            .or_else(|| candidate.get("value"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(format!("用户回答：{answer}"));
+        }
+    }
+    question_answer_from_response(control_response, &question.question)
+        .map(|answer| format!("用户回答：{answer}"))
+}
+
+fn feedback_from_answers(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(format!("用户回答：{text}"));
+    }
+    let object = value.as_object()?;
+    let pairs = object
+        .iter()
+        .filter_map(|(key, value)| {
+            answer_text_from_value(value).map(|answer| format!("- {key}: {answer}"))
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(format!("用户表单回答：\n{}", pairs.join("\n")))
+}
+
+fn answer_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(answer_text_from_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => (!object.is_empty())
+            .then(|| serde_json::to_string(value).ok())
+            .flatten(),
+        Value::Null => None,
+        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+    }
+}
+
+fn default_question_answer_feedback(question: &TtyQuestion) -> String {
+    let choices = question
+        .options
+        .iter()
+        .filter(|option| !option.special)
+        .map(|option| option.label.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if choices.is_empty() {
+        format!("用户需要回答这个问题：{}", question.question)
+    } else {
+        format!(
+            "用户需要回答这个问题：{}。可选项：{}",
+            question.question, choices
+        )
+    }
+}
+
+fn question_answer_from_response(control_response: &Value, question: &str) -> Option<String> {
+    let body = control_response
+        .get("response")
+        .and_then(|response| response.get("response"))?;
+    for candidate in question_answer_candidates(body) {
+        if let Some(answer) = answer_from_question_map(candidate.get("answers"), question) {
+            return Some(answer);
+        }
+        if let Some(answer) = answer_from_question_map(candidate.get("content"), question) {
+            return Some(answer);
+        }
+        if let Some(answer) = candidate
+            .get("answer")
+            .or_else(|| candidate.get("value"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(answer.to_owned());
+        }
+    }
+    None
+}
+
+fn question_answer_candidates(body: &Value) -> Vec<&Value> {
+    [
+        body.get("updatedInput"),
+        body.get("updated_input"),
+        body.get("input"),
+        Some(body),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn answer_from_question_map(value: Option<&Value>, question: &str) -> Option<String> {
+    let value = value?;
+    if let Some(answer) = value.get(question).and_then(answer_text_from_value) {
+        return Some(answer);
+    }
+    let object = value.as_object()?;
+    if object.len() == 1 {
+        return object.values().next().and_then(answer_text_from_value);
+    }
+    None
 }
 
 fn deny_selection_for_tty_permission_prompt(output: &str, tool_use: &ToolUse) -> &'static [u8] {
@@ -1152,6 +1797,29 @@ async fn wait_for_tty_permission_feedback_prompt(process: &PtyProcess) -> bool {
     while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
         let output = process.recent_output();
         if tty_output_has_permission_feedback_prompt(&output) {
+            return true;
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+    false
+}
+
+async fn wait_for_tty_question_feedback_prompt(process: &PtyProcess) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
+        let output = process.recent_output();
+        if tty_output_has_question_feedback_prompt(&output) {
+            return true;
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+    false
+}
+
+async fn wait_for_tty_question_form(process: &PtyProcess) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
+        if tty_question_from_form(&process.recent_output()).is_some() {
             return true;
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
@@ -1226,6 +1894,19 @@ fn tty_output_has_permission_feedback_prompt(output: &str) -> bool {
         || output.contains("What should Claude do")
         || output.contains("reason")
         || compact.contains("tellClaudewhattododifferently")
+        || compact.contains("TellClaudewhattododifferently")
+}
+
+fn tty_output_has_question_feedback_prompt(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    output.contains("What should Claude do instead")
+        || output.contains("What should Claude do")
+        || output.contains("How should Claude proceed")
+        || output.contains("Tell Claude what to do differently")
+        || compact.contains("WhatshouldClaudedoinstead")
+        || compact.contains("WhatshouldClaudedo")
+        || compact.contains("HowshouldClaudeproceed")
         || compact.contains("TellClaudewhattododifferently")
 }
 
@@ -1417,6 +2098,7 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
                 .chars()
                 .rev()
                 .collect::<String>();
+            logging::event(format!("tty_startup_timeout recent={recent}"));
             return Err(CcttyError::Timeout(format!(
                 "timed out waiting for Claude prompt; recent tty output: {recent}"
             )));
@@ -1480,6 +2162,29 @@ fn plain_tty_output(output: &str) -> String {
         }
     }
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn recent_tty_log_text(output: &str, max_chars: usize) -> String {
+    plain_tty_output(output)
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+}
+
+fn single_line_log_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|ch| match ch {
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect(),
+            '\t' => "\\t".chars().collect(),
+            other if other.is_control() => format!("\\u{{{:x}}}", other as u32).chars().collect(),
+            other => vec![other],
+        })
+        .collect()
 }
 
 fn visible_tty_lines(output: &str) -> Vec<String> {
@@ -1627,10 +2332,12 @@ struct TailCursor {
     config_dir: PathBuf,
     project_dir: PathBuf,
     offset: u64,
+    attach_existing: bool,
+    started_at: SystemTime,
 }
 
 impl TailCursor {
-    fn new(path: Option<PathBuf>, config_dir: &Path) -> Result<Self> {
+    fn new(path: Option<PathBuf>, config_dir: &Path, attach_existing: bool) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let project_dir = config_dir
@@ -1641,11 +2348,14 @@ impl TailCursor {
             config_dir: config_dir.to_path_buf(),
             project_dir,
             offset: 0,
+            attach_existing,
+            started_at: SystemTime::now(),
         })
     }
 
     fn prepare_offset(&mut self) -> Result<()> {
-        if self.path.is_none() {
+        self.started_at = SystemTime::now();
+        if self.path.is_none() && self.attach_existing {
             self.path = newest_transcript(&self.project_dir)?;
         }
         self.offset = self
@@ -1659,7 +2369,11 @@ impl TailCursor {
 
     fn resolve_path(&mut self) -> Result<Option<PathBuf>> {
         if self.path.is_none() {
-            self.path = newest_transcript(&self.project_dir)?;
+            self.path = if self.attach_existing {
+                newest_transcript(&self.project_dir)?
+            } else {
+                newest_transcript_since(&self.project_dir, self.started_at)?
+            };
         }
         let _ = &self.config_dir;
         Ok(self.path.clone())
@@ -1694,6 +2408,19 @@ fn remove_dir_if_empty(path: &Path) -> Result<()> {
 }
 
 fn newest_transcript(project_dir: &Path) -> Result<Option<PathBuf>> {
+    newest_transcript_matching(project_dir, |_| true)
+}
+
+fn newest_transcript_since(project_dir: &Path, started_at: SystemTime) -> Result<Option<PathBuf>> {
+    newest_transcript_matching(project_dir, |modified| {
+        modified.is_some_and(|modified| modified >= started_at)
+    })
+}
+
+fn newest_transcript_matching(
+    project_dir: &Path,
+    include: impl Fn(Option<SystemTime>) -> bool,
+) -> Result<Option<PathBuf>> {
     let Ok(entries) = std::fs::read_dir(project_dir) else {
         return Ok(None);
     };
@@ -1705,6 +2432,9 @@ fn newest_transcript(project_dir: &Path) -> Result<Option<PathBuf>> {
             continue;
         }
         let modified = entry.metadata()?.modified().ok();
+        if !include(modified) {
+            continue;
+        }
         if newest
             .as_ref()
             .and_then(|(_, modified)| *modified)
@@ -1829,6 +2559,36 @@ mod tests {
             deny_selection_for_tty_permission_prompt(output, &tool_use),
             b"3\r"
         );
+    }
+
+    #[test]
+    fn parses_tty_ask_user_question_form() {
+        let output = "\
+            ← ☐ 文档类型 ☐ 目标读者 ☐ 语言 ☐ 输出位置 ✔ Submit → \
+            你想写什么类型的文档？ \
+            ❯ 1. 技术设计文档 描述某个功能/系统的架构、方案、实现细节 \
+            2. README / 使用说明 项目介绍、安装、用法说明 \
+            3. 产品需求文档 (PRD) 描述产品功能、用户场景、需求范围 \
+            4. 操作/教程指南 一步步指导如何完成某项任务 \
+            5. Type something. \
+            6. Chat about this Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        let question = tty_question_from_form(output).expect("question form should parse");
+
+        assert_eq!(question.question, "你想写什么类型的文档？");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .filter(|option| !option.special)
+                .count(),
+            4
+        );
+        assert_eq!(
+            question.options[0].label,
+            "技术设计文档 描述某个功能/系统的架构、方案、实现细节"
+        );
+        assert_eq!(question.options[4].label, "Type something");
+        assert!(question.options[4].special);
     }
 
     #[test]

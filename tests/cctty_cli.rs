@@ -21,6 +21,26 @@ fn proxies_version_to_real_claude() {
 }
 
 #[test]
+fn writes_diagnostic_log_to_configured_file() {
+    let fixture = FakeClaude::new();
+    let log = tempfile::NamedTempFile::new().unwrap();
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CCTTY_LOG_FILE", log.path())
+        .arg("--version")
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(log.path()).unwrap();
+    assert!(text.contains("start mode=Passthrough"), "{text}");
+    assert!(text.contains("passthrough_spawn"), "{text}");
+    assert!(text.contains("passthrough_exit exit_code=0"), "{text}");
+    assert!(text.contains("finish exit_code=0"), "{text}");
+}
+
+#[test]
 fn stream_json_text_prompt_uses_tty_transcript() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -651,6 +671,139 @@ fn stream_json_permission_prompt_stdio_maps_denial_to_keyboard_form() {
         "expected can_use_tool control_request"
     );
     assert!(saw_denied_result, "expected denied fake tool result");
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_permission_prompt_stdio_round_trips_ask_user_question_form() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000011";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_FAKE_ASK_USER_QUESTION"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut question_request_count = 0;
+    let mut result = String::new();
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                question_request_count += 1;
+                assert_eq!(
+                    value["request"]["subtype"],
+                    Value::String("can_use_tool".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["tool_name"],
+                    Value::String("AskUserQuestion".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["input"]["questions"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                assert!(
+                    request_id.starts_with("cctty_permission_"),
+                    "AskUserQuestion should use transcript tool input, not TTY fallback: {request_id}"
+                );
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow",
+                                "updatedInput": {
+                                    "answers": {
+                                        "What kind of document do you want?": [
+                                            "Technical design",
+                                            "API examples"
+                                        ],
+                                        "Who is the audience?": {
+                                            "role": "Developers",
+                                            "experience": "SDK users"
+                                        },
+                                        "Include examples": true
+                                    }
+                                }
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                result = value["result"].as_str().unwrap_or_default().to_owned();
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        question_request_count, 1,
+        "expected exactly one AskUserQuestion can_use_tool request"
+    );
+    assert!(
+        result.contains("FAKE_ASK_USER_FEEDBACK: 用户表单回答："),
+        "result:\n{result}"
+    );
+    assert!(
+        result.contains("- What kind of document do you want?: Technical design, API examples"),
+        "result:\n{result}"
+    );
+    assert!(
+        result.contains("- Include examples: true"),
+        "result:\n{result}"
+    );
+    assert!(result.contains("Developers"), "result:\n{result}");
+    assert!(result.contains("SDK users"), "result:\n{result}");
+
     let status = child
         .wait_timeout(Duration::from_secs(5))
         .unwrap()

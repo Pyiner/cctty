@@ -138,6 +138,30 @@ Claude binary:
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
 
+## Diagnostics
+
+`cctty` writes a small local diagnostic log by default. It records process
+startup, resolved Claude path, SDK control requests, permission decisions,
+synthetic result/idle events, and timeout summaries. It does not log full prompt
+text by default.
+
+Default paths:
+
+- macOS: `~/Library/Logs/cctty/cctty.log`
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/cctty/cctty.log`
+
+Controls:
+
+```sh
+CCTTY_LOG_FILE=/tmp/cctty.log cctty --version
+CCTTY_LOG=0 cctty --version
+CCTTY_LOG_TTY=1 CCTTY_LOG_FILE=/tmp/cctty.log cctty -p "Reply OK"
+```
+
+`CCTTY_LOG_TTY=1` also records recent visible TTY text around waits/timeouts.
+Use it only for local debugging because that text can include prompts and model
+output.
+
 ## Replacement Boundary
 
 `cctty` replaces the `claude` executable used by the Claude Agent SDK and
@@ -351,6 +375,14 @@ For SDK permission callbacks, `cctty` consumes the hidden
 `control_request` messages, waits for SDK `control_response` decisions, and then
 drives Claude's interactive permission UI with keyboard input.
 
+Claude's interactive `AskUserQuestion` forms are bridged through the same SDK
+control channel. When Claude asks a structured question, `cctty` forwards the
+original `AskUserQuestion` tool input to the SDK caller. If the caller returns
+`updatedInput.answers`, `answers`, `content`, or similar structured form data,
+`cctty` renders those answers as text and feeds them back into Claude's TTY
+follow-up prompt, so SDK hosts can answer forms without pretending to click the
+terminal UI.
+
 ## Tests
 
 Fast deterministic tests use a fake interactive Claude binary:
@@ -492,7 +524,7 @@ Some SDKs pass flags that are not listed in current `claude --help`.
 
 | Option(s) | Status | Current handling | Notes |
 | --- | --- | --- | --- |
-| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries and also recognizes real TTY permission forms when Claude has not persisted the transcript yet. It emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive permission UI by keyboard. Bash allow confirms the selected row; Bash deny selects menu item `2` and pastes the SDK denial message into Claude's follow-up form when present. File create/write/edit/update forms are mapped to `Write`/`Edit` with `file_path`; allow confirms the selected row, while deny selects the file prompt's `3. No` row to avoid accidentally choosing "allow all edits during this session". If interactive Claude returns to the prompt after a rejected tool without writing a final result, `cctty` emits a synthetic error result with `result: "Permission denied"`. | Fake-PTY tests cover transcript-first allow/deny, Bash TTY-form-before-transcript, file Write TTY-form-before-transcript, and transcript-vs-TTY description precedence. Live Claude Code `2.1.144` coverage forces `Bash(printf:*)` approval with project-local settings and verifies both allow and deny. Live Python and TypeScript SDK game tests exercise `Write` approval through real file-creation TTY forms. Still partial: broader `Edit`/`MultiEdit` TTY variants, exact `permission_suggestions`, and exact `blocked_path` parity are not complete. |
+| `--permission-prompt-tool stdio` | Partial | Consumed by `cctty`, not forwarded to interactive Claude. In `stream-json` mode, `cctty` watches transcript `assistant.tool_use` entries and also recognizes real TTY permission forms when Claude has not persisted the transcript yet. It emits SDK-style `control_request` / `can_use_tool`, waits for the matching `control_response`, then drives the interactive permission UI by keyboard. Bash allow confirms the selected row; Bash deny selects menu item `2` and pastes the SDK denial message into Claude's follow-up form when present. File create/write/edit/update forms are mapped to `Write`/`Edit` with `file_path`; allow confirms the selected row, while deny selects the file prompt's `3. No` row to avoid accidentally choosing "allow all edits during this session". `AskUserQuestion` form tool uses are forwarded with their original structured `questions` input; SDK-returned structured answers are textified and sent back through Claude's follow-up prompt. If interactive Claude returns to the prompt after a rejected tool without writing a final result, `cctty` emits a synthetic error result with `result: "Permission denied"`. | Fake-PTY tests cover transcript-first allow/deny, Bash TTY-form-before-transcript, file Write TTY-form-before-transcript, transcript-vs-TTY description precedence, and `AskUserQuestion` structured form answer round-trip. Live Claude Code `2.1.144` coverage forces `Bash(printf:*)` approval with project-local settings and verifies both allow and deny. Live Python and TypeScript SDK game tests exercise `Write` approval through real file-creation TTY forms. Still partial: broader `Edit`/`MultiEdit` TTY variants, exact `permission_suggestions`, exact `blocked_path` parity, and live `AskUserQuestion` coverage are not complete. |
 | `--permission-prompt-tool <name>` | Pass-through | Non-`stdio` values are forwarded to interactive Claude. `cctty` does not emulate custom permission prompt tools itself. | Parser coverage only. |
 | `--system-prompt-file` | Pass-through | Forwarded to interactive Claude. | Parser coverage because SDKs/older CLIs may emit it. |
 | `--task-budget`, `--max-thinking-tokens`, `--thinking`, `--thinking-display`, `--managed-settings`, `--resume-session-at` | Pass-through | Forwarded to interactive Claude. | Parser coverage only. These are SDK/newer-CLI compatibility entries, not from the captured help output above. |
@@ -505,7 +537,8 @@ Some SDKs pass flags that are not listed in current `claude --help`.
   `plan`, `auto`, `dontAsk`, `acceptEdits`, `bypassPermissions`, and `default`
   have focused live coverage. Remaining risk is breadth: more
   `Edit`/`MultiEdit` TTY variants, `allowedTools`/`disallowedTools`
-  interactions, and exact SDK metadata fields still need live coverage.
+  interactions, live `AskUserQuestion` form coverage, and exact SDK metadata
+  fields still need live coverage.
 - `--include-partial-messages` is compatibility-oriented, not true token-level
   streaming. cctty emits synthetic text deltas once transcript text is
   persisted; this unblocks SDK wrappers, but does not perfectly match Claude
