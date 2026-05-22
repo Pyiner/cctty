@@ -67,6 +67,51 @@ const CURRENT_CLAUDE_HELP_FLAGS: &[&str] = &[
     "--worktree",
 ];
 
+const HIDDEN_SDK_AND_NATIVE_FLAGS: &[&str] = &[
+    "--advisor",
+    "--agent-color",
+    "--agent-id",
+    "--agent-name",
+    "--agent-type",
+    "--append-system-prompt-file",
+    "--channels",
+    "--cowork",
+    "--dangerously-load-development-channels",
+    "--deep-link-cwd-b64",
+    "--deep-link-last-fetch",
+    "--deep-link-origin",
+    "--deep-link-repo",
+    "--enable-auth-status",
+    "--enable-auto-mode",
+    "--init",
+    "--init-only",
+    "--maintenance",
+    "--managed-settings",
+    "--max-thinking-tokens",
+    "--max-turns",
+    "--parent-session-id",
+    "--permission-prompt-tool",
+    "--plan-mode-instructions",
+    "--plan-mode-required",
+    "--prefill",
+    "--prefill-b64",
+    "--rc",
+    "--remote",
+    "--resume-session-at",
+    "--rewind-files",
+    "--sdk-url",
+    "--session-mirror",
+    "--system-prompt-file",
+    "--task-budget",
+    "--team-name",
+    "--teammate-mode",
+    "--teleport",
+    "--thinking",
+    "--thinking-display",
+    "--workload",
+    "--xaa",
+];
+
 #[test]
 fn readme_compatibility_matrix_mentions_every_captured_claude_help_flag() {
     let readme = include_str!("../README.md");
@@ -78,6 +123,17 @@ fn readme_compatibility_matrix_mentions_every_captured_claude_help_flag() {
         assert!(
             readme.contains(&format!("`{flag}`")),
             "README compatibility matrix does not mention {flag}"
+        );
+    }
+}
+
+#[test]
+fn readme_compatibility_matrix_mentions_hidden_sdk_and_native_flags() {
+    let readme = include_str!("../README.md");
+    for flag in HIDDEN_SDK_AND_NATIVE_FLAGS {
+        assert!(
+            readme.contains(&format!("`{flag}`")) || readme.contains(&format!("`{flag},")),
+            "README hidden compatibility matrix does not mention {flag}"
         );
     }
 }

@@ -1,5 +1,8 @@
-use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Read, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
+use std::io::{BufRead, BufReader as StdBufReader, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,6 +26,7 @@ const TTY_READY_SETTLE: Duration = Duration::from_millis(250);
 const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_PERMISSION_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
 const TTY_QUESTION_FORM_SETTLE: Duration = Duration::from_millis(250);
+const MCP_PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -30,6 +34,56 @@ pub async fn run(invocation: Invocation) -> Result<i32> {
         CommandMode::Passthrough => run_passthrough(&invocation).await,
         CommandMode::Print => run_print(invocation).await,
     }
+}
+
+pub(crate) fn run_mcp_proxy(argv: Vec<String>) -> Result<i32> {
+    let socket_path = argv
+        .get(2)
+        .ok_or_else(|| CcttyError::Usage("__cctty-mcp-proxy missing socket path".to_owned()))?;
+    let server_name = argv
+        .get(3)
+        .ok_or_else(|| CcttyError::Usage("__cctty-mcp-proxy missing server name".to_owned()))?;
+    run_mcp_proxy_stdio(Path::new(socket_path), server_name)
+}
+
+#[cfg(unix)]
+fn run_mcp_proxy_stdio(socket_path: &Path, server_name: &str) -> Result<i32> {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    let reader = StdBufReader::new(stdin.lock());
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message = serde_json::from_str::<Value>(trimmed)?;
+        let mut stream = UnixStream::connect(socket_path)?;
+        writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&json!({
+                "server_name": server_name,
+                "message": message,
+            }))?
+        )?;
+        stream.flush()?;
+
+        let mut response_line = String::new();
+        StdBufReader::new(stream).read_line(&mut response_line)?;
+        let response = serde_json::from_str::<Value>(response_line.trim())?;
+        let mcp_response = response.get("mcp_response").cloned().unwrap_or(Value::Null);
+        writeln!(stdout, "{}", serde_json::to_string(&mcp_response)?)?;
+        stdout.flush()?;
+    }
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+fn run_mcp_proxy_stdio(_socket_path: &Path, _server_name: &str) -> Result<i32> {
+    Err(CcttyError::Usage(
+        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
+    ))
 }
 
 async fn run_passthrough(invocation: &Invocation) -> Result<i32> {
@@ -68,27 +122,48 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             .map(|session_id| transcript_path(&config_dir, &cwd, session_id))
     };
     let env = interactive_claude_env();
-    logging::event(format!(
-        "tty_spawn claude={} cwd={} session_id={} input={:?} output={:?} permission_prompt_stdio={} include_partial_messages={}",
-        claude,
-        cwd.display(),
-        session_id.as_deref().unwrap_or(""),
-        invocation.input_format,
-        invocation.output_format,
-        invocation.permission_prompt_tool_stdio,
-        invocation.include_partial_messages
-    ));
+    let mut passthrough_args = invocation.passthrough_args.clone();
+    let mut current_session_id = session_id.clone();
+    let mut attach_existing = invocation.continue_conversation;
+    let mut transcript = transcript;
+    let mut process = spawn_tty_process(
+        &claude,
+        &cwd,
+        &env,
+        &passthrough_args,
+        &current_session_id,
+        &invocation,
+    )?;
+    if invocation.input_format == InputFormat::Text {
+        if let Err(error) = prepare_tty_for_prompt(&mut process).await {
+            if is_bad_resume_startup_error(&error) {
+                let stripped_args = strip_session_resume_args(&passthrough_args);
+                if stripped_args != passthrough_args {
+                    logging::event("tty_restart reason=bad_resume action=strip_resume_args");
+                    process.kill();
+                    passthrough_args = stripped_args;
+                    current_session_id = None;
+                    attach_existing = false;
+                    transcript = None;
+                    process = spawn_tty_process(
+                        &claude,
+                        &cwd,
+                        &env,
+                        &passthrough_args,
+                        &current_session_id,
+                        &invocation,
+                    )?;
+                    prepare_tty_for_prompt(&mut process).await?;
+                } else {
+                    return Err(error);
+                }
+            } else {
+                return Err(error);
+            }
+        }
+    }
 
-    let mut process = PtyProcess::spawn(&PtySpawnSpec {
-        command: claude,
-        args: invocation.passthrough_args.clone(),
-        cwd,
-        env,
-        unset_env: interactive_claude_unset_env(),
-    })?;
-    prepare_tty_for_prompt(&mut process).await?;
-
-    let mut tail = TailCursor::new(transcript, &config_dir, invocation.continue_conversation)?;
+    let mut tail = TailCursor::new(transcript, &config_dir, attach_existing)?;
 
     match invocation.input_format {
         InputFormat::Text => {
@@ -104,9 +179,18 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             write_final_output(&outcome, invocation.output_format)?;
         }
         InputFormat::StreamJson => {
+            let stream_spawn = StreamSpawnContext {
+                claude: &claude,
+                cwd: &cwd,
+                env: &env,
+                args: passthrough_args.clone(),
+                session_id: &current_session_id,
+                invocation: &invocation,
+            };
             run_stream_json(
                 &mut process,
                 &mut tail,
+                &stream_spawn,
                 invocation.output_format,
                 invocation.permission_prompt_tool_stdio,
                 invocation.include_partial_messages,
@@ -120,6 +204,34 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         tail.remove_current_transcript()?;
     }
     Ok(0)
+}
+
+fn spawn_tty_process(
+    claude: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    args: &[String],
+    session_id: &Option<String>,
+    invocation: &Invocation,
+) -> Result<PtyProcess> {
+    logging::event(format!(
+        "tty_spawn claude={} cwd={} session_id={} input={:?} output={:?} permission_prompt_stdio={} include_partial_messages={} args={}",
+        claude,
+        cwd.display(),
+        session_id.as_deref().unwrap_or(""),
+        invocation.input_format,
+        invocation.output_format,
+        invocation.permission_prompt_tool_stdio,
+        invocation.include_partial_messages,
+        sanitized_arg_shape(args)
+    ));
+    PtyProcess::spawn(&PtySpawnSpec {
+        command: claude.to_owned(),
+        args: args.to_vec(),
+        cwd: cwd.to_path_buf(),
+        env: env.clone(),
+        unset_env: interactive_claude_unset_env(),
+    })
 }
 
 fn interactive_claude_env() -> HashMap<String, String> {
@@ -140,9 +252,405 @@ fn interactive_claude_unset_env() -> Vec<String> {
     .collect()
 }
 
+fn is_bad_resume_startup_error(error: &CcttyError) -> bool {
+    matches!(error, CcttyError::Tty(message) if tty_output_has_bad_resume_startup_error(message))
+}
+
+fn strip_session_resume_args(args: &[String]) -> Vec<String> {
+    let mut stripped = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if matches!(
+            arg.as_str(),
+            "--session-id" | "--resume" | "-r" | "--resume-session-at"
+        ) {
+            index += 1;
+            if index < args.len() && !args[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(arg.as_str(), "--continue" | "-c" | "--fork-session")
+            || arg.starts_with("--session-id=")
+            || arg.starts_with("--resume=")
+            || arg.starts_with("--resume-session-at=")
+        {
+            index += 1;
+            continue;
+        }
+        stripped.push(arg.clone());
+        index += 1;
+    }
+    stripped
+}
+
+fn sanitized_arg_shape(args: &[String]) -> String {
+    if args.is_empty() {
+        return "-".to_owned();
+    }
+    args.iter()
+        .map(|arg| {
+            if arg.starts_with('-') {
+                arg.split_once('=')
+                    .map(|(flag, _)| format!("{flag}=<value>"))
+                    .unwrap_or_else(|| arg.clone())
+            } else {
+                "<value>".to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct StreamSpawnContext<'a> {
+    claude: &'a str,
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    args: Vec<String>,
+    session_id: &'a Option<String>,
+    invocation: &'a Invocation,
+}
+
+struct SdkStreamState {
+    mcp_servers: Vec<McpServerStatus>,
+    mcp_runtime: Option<SdkMcpRuntime>,
+    deferred_input: VecDeque<Value>,
+    next_mcp_request_id: u64,
+}
+
+impl SdkStreamState {
+    fn new(args: &[String]) -> Self {
+        let mut state = Self {
+            mcp_servers: mcp_servers_from_args(args),
+            mcp_runtime: None,
+            deferred_input: VecDeque::new(),
+            next_mcp_request_id: 0,
+        };
+        state.add_sdk_mcp_servers(sdk_mcp_servers_from_args(args));
+        state
+    }
+
+    fn add_sdk_mcp_servers(&mut self, names: Vec<String>) {
+        for name in names {
+            if self.mcp_servers.iter().any(|server| server.name == name) {
+                continue;
+            }
+            self.mcp_servers.push(McpServerStatus {
+                name,
+                kind: "sdk".to_owned(),
+            });
+        }
+    }
+
+    fn sdk_mcp_server_names(&self) -> Vec<String> {
+        self.mcp_servers
+            .iter()
+            .filter(|server| server.kind == "sdk")
+            .map(|server| server.name.clone())
+            .collect()
+    }
+
+    fn next_mcp_request_id(&mut self) -> String {
+        self.next_mcp_request_id += 1;
+        format!("cctty-mcp-{}", self.next_mcp_request_id)
+    }
+
+    fn mcp_status(&self) -> Value {
+        let sdk_runtime_started = self.mcp_runtime.is_some();
+        let servers = self
+            .mcp_servers
+            .iter()
+            .map(|server| {
+                let is_sdk = server.kind == "sdk";
+                json!({
+                    "name": server.name,
+                    "status": if is_sdk && !sdk_runtime_started { "pending" } else { "connected" },
+                    "serverInfo": {
+                        "name": server.name,
+                        "version": if is_sdk { "cctty-sdk-proxy" } else { "unknown" },
+                    },
+                    "config": if is_sdk {
+                        json!({ "type": "sdk", "name": server.name })
+                    } else {
+                        json!({ "type": server.kind, "source": "mcp-config" })
+                    },
+                    "scope": "session",
+                    "tools": [],
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "mcpServers": servers })
+    }
+}
+
+struct McpServerStatus {
+    name: String,
+    kind: String,
+}
+
+#[cfg(unix)]
+struct SdkMcpRuntime {
+    socket_path: PathBuf,
+    listener: UnixListener,
+    servers: Vec<String>,
+}
+
+#[cfg(unix)]
+impl Drop for SdkMcpRuntime {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(not(unix))]
+struct SdkMcpRuntime {
+    servers: Vec<String>,
+}
+
+fn mcp_config_values_from_args(args: &[String]) -> Vec<String> {
+    let mut configs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--mcp-config" {
+            if let Some(value) = args.get(index + 1) {
+                configs.push(value.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--mcp-config=") {
+            configs.push(value.to_owned());
+        }
+        index += 1;
+    }
+    configs
+}
+
+fn mcp_servers_from_args(args: &[String]) -> Vec<McpServerStatus> {
+    let mut servers = Vec::new();
+    for config in mcp_config_values_from_args(args) {
+        if let Ok(value) = serde_json::from_str::<Value>(&config) {
+            if let Some(mcp_servers) = value.get("mcpServers").and_then(Value::as_object) {
+                for (name, server) in mcp_servers {
+                    let kind = server
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    if servers
+                        .iter()
+                        .any(|existing: &McpServerStatus| existing.name == name.as_str())
+                    {
+                        continue;
+                    }
+                    servers.push(McpServerStatus {
+                        name: name.clone(),
+                        kind,
+                    });
+                }
+            }
+        }
+    }
+    servers
+}
+
+fn sdk_mcp_servers_from_args(args: &[String]) -> Vec<String> {
+    let mut servers = Vec::new();
+    for config in mcp_config_values_from_args(args) {
+        if let Ok(value) = serde_json::from_str::<Value>(&config) {
+            if let Some(mcp_servers) = value.get("mcpServers").and_then(Value::as_object) {
+                for (name, server) in mcp_servers {
+                    if server.get("type").and_then(Value::as_str) == Some("sdk") {
+                        let server_name = server
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(name)
+                            .to_owned();
+                        if !servers.contains(&server_name) {
+                            servers.push(server_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    servers
+}
+
+fn sdk_mcp_servers_from_initialize(value: &Value) -> Vec<String> {
+    value
+        .get("request")
+        .and_then(|request| request.get("sdkMcpServers"))
+        .and_then(Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn ensure_sdk_mcp_runtime(
+    process: &mut PtyProcess,
+    input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
+    spawn: &StreamSpawnContext<'_>,
+) -> Result<()> {
+    if sdk_state.mcp_runtime.is_some() {
+        return Ok(());
+    }
+    let servers = sdk_state.sdk_mcp_server_names();
+    if servers.is_empty() {
+        return Ok(());
+    }
+
+    let runtime = create_sdk_mcp_runtime(servers)?;
+    let rewritten_args = args_with_mcp_runtime(&spawn.args, &runtime)?;
+    logging::event(format!(
+        "mcp_runtime_start socket={} servers={}",
+        sdk_mcp_runtime_socket_path(&runtime),
+        sdk_mcp_runtime_servers(&runtime).join(",")
+    ));
+    logging::event(format!(
+        "tty_restart reason=sdk_mcp servers={} args={}",
+        sdk_mcp_runtime_servers(&runtime).join(","),
+        sanitized_arg_shape(&rewritten_args)
+    ));
+    process.kill();
+    *process = spawn_tty_process(
+        spawn.claude,
+        spawn.cwd,
+        spawn.env,
+        &rewritten_args,
+        spawn.session_id,
+        spawn.invocation,
+    )?;
+    prepare_tty_for_prompt_with_mcp(process, input, &runtime, sdk_state).await?;
+    sdk_state.mcp_runtime = Some(runtime);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_sdk_mcp_runtime(servers: Vec<String>) -> Result<SdkMcpRuntime> {
+    let socket_path = std::env::temp_dir().join(format!("ct-{}.sock", Uuid::new_v4()));
+    let listener = UnixListener::bind(&socket_path)?;
+    listener.set_nonblocking(true)?;
+    Ok(SdkMcpRuntime {
+        socket_path,
+        listener,
+        servers,
+    })
+}
+
+#[cfg(not(unix))]
+fn create_sdk_mcp_runtime(servers: Vec<String>) -> Result<SdkMcpRuntime> {
+    let _ = servers;
+    Err(CcttyError::Usage(
+        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn sdk_mcp_runtime_socket_path(runtime: &SdkMcpRuntime) -> String {
+    runtime.socket_path.to_string_lossy().into_owned()
+}
+
+#[cfg(not(unix))]
+fn sdk_mcp_runtime_socket_path(_runtime: &SdkMcpRuntime) -> String {
+    "-".to_owned()
+}
+
+fn sdk_mcp_runtime_servers(runtime: &SdkMcpRuntime) -> &[String] {
+    &runtime.servers
+}
+
+fn args_with_mcp_runtime(args: &[String], runtime: &SdkMcpRuntime) -> Result<Vec<String>> {
+    let mut rewritten = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--mcp-config" {
+            if let Some(value) = args.get(index + 1) {
+                if let Some(stripped) = mcp_config_without_sdk_servers(value)? {
+                    rewritten.push(arg.clone());
+                    rewritten.push(stripped);
+                }
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--mcp-config=") {
+            if let Some(stripped) = mcp_config_without_sdk_servers(value)? {
+                rewritten.push(format!("--mcp-config={stripped}"));
+            }
+            index += 1;
+            continue;
+        }
+        rewritten.push(arg.clone());
+        index += 1;
+    }
+    rewritten.push("--mcp-config".to_owned());
+    rewritten.push(sdk_mcp_proxy_config(runtime)?);
+    Ok(rewritten)
+}
+
+fn mcp_config_without_sdk_servers(raw: &str) -> Result<Option<String>> {
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        return Ok(Some(raw.to_owned()));
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Ok(Some(raw.to_owned()));
+    };
+    if let Some(mcp_servers) = object.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        mcp_servers.retain(|_, server| server.get("type").and_then(Value::as_str) != Some("sdk"));
+        if mcp_servers.is_empty() {
+            object.remove("mcpServers");
+        }
+    }
+    if object.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&value)?))
+}
+
+#[cfg(unix)]
+fn sdk_mcp_proxy_config(runtime: &SdkMcpRuntime) -> Result<String> {
+    let executable = std::env::current_exe()?;
+    let mut mcp_servers = serde_json::Map::new();
+    for server in &runtime.servers {
+        mcp_servers.insert(
+            server.clone(),
+            json!({
+                "type": "stdio",
+                "command": executable,
+                "args": [
+                    "__cctty-mcp-proxy",
+                    runtime.socket_path.to_string_lossy(),
+                    server,
+                ],
+            }),
+        );
+    }
+    Ok(serde_json::to_string(
+        &json!({ "mcpServers": mcp_servers }),
+    )?)
+}
+
+#[cfg(not(unix))]
+fn sdk_mcp_proxy_config(_runtime: &SdkMcpRuntime) -> Result<String> {
+    Err(CcttyError::Usage(
+        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
+    ))
+}
+
 async fn run_stream_json(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
+    spawn: &StreamSpawnContext<'_>,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
     include_partial_messages: bool,
@@ -152,21 +660,36 @@ async fn run_stream_json(
             "--input-format stream-json currently requires --output-format stream-json".to_owned(),
         ));
     }
-
     let mut input = spawn_stdin_json_reader();
-    while let Some(value) = input.recv().await {
+    let mut sdk_state = SdkStreamState::new(&spawn.args);
+    let mut tty_prepared = false;
+    loop {
+        let value = if let Some(value) = sdk_state.deferred_input.pop_front() {
+            value
+        } else {
+            match input.recv().await {
+                Some(value) => value,
+                None => break,
+            }
+        };
         match value.get("type").and_then(Value::as_str) {
             Some("control_request") => {
-                handle_control_request(process, &value)?;
+                handle_control_request(process, &mut input, &mut sdk_state, spawn, &value).await?
             }
             Some("control_response") => {}
             Some("control_cancel_request") => {}
             Some("user") => {
+                ensure_sdk_mcp_runtime(process, &mut input, &mut sdk_state, spawn).await?;
+                if !tty_prepared {
+                    prepare_stream_tty_for_prompt(process, tail, spawn).await?;
+                    tty_prepared = true;
+                }
                 let prompt = user_prompt_from_sdk_message(&value)?;
                 let _ = submit_prompt_and_tail_stream(
                     process,
                     tail,
                     &mut input,
+                    &mut sdk_state,
                     &prompt,
                     output_format,
                     permission_prompt_tool_stdio,
@@ -178,6 +701,36 @@ async fn run_stream_json(
         }
     }
     Ok(())
+}
+
+async fn prepare_stream_tty_for_prompt(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    spawn: &StreamSpawnContext<'_>,
+) -> Result<()> {
+    match prepare_tty_for_prompt(process).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_bad_resume_startup_error(&error) => {
+            let stripped_args = strip_session_resume_args(&spawn.args);
+            if stripped_args == spawn.args {
+                return Err(error);
+            }
+            logging::event("tty_restart reason=bad_resume action=strip_resume_args");
+            process.kill();
+            *process = spawn_tty_process(
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &stripped_args,
+                &None,
+                spawn.invocation,
+            )?;
+            prepare_tty_for_prompt(process).await?;
+            tail.reset_for_new_session();
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn spawn_stdin_json_reader() -> mpsc::Receiver<Value> {
@@ -225,7 +778,125 @@ fn spawn_stdin_json_reader() -> mpsc::Receiver<Value> {
     rx
 }
 
-fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()> {
+async fn service_pending_mcp_proxy_requests(
+    input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
+) -> Result<()> {
+    let Some(runtime) = sdk_state.mcp_runtime.take() else {
+        return Ok(());
+    };
+    let result = service_pending_mcp_proxy_requests_for_runtime(input, &runtime, sdk_state).await;
+    sdk_state.mcp_runtime = Some(runtime);
+    result
+}
+
+#[cfg(unix)]
+async fn service_pending_mcp_proxy_requests_for_runtime(
+    input: &mut mpsc::Receiver<Value>,
+    runtime: &SdkMcpRuntime,
+    sdk_state: &mut SdkStreamState,
+) -> Result<()> {
+    loop {
+        let (mut stream, _) = match runtime.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut line = String::new();
+        {
+            let mut reader = StdBufReader::new(stream.try_clone()?);
+            reader.read_line(&mut line)?;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let envelope: Value = serde_json::from_str(line.trim())?;
+        let server_name = envelope
+            .get("server_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let message = envelope.get("message").cloned().unwrap_or(Value::Null);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let request_id = sdk_state.next_mcp_request_id();
+        logging::event(format!(
+            "mcp_proxy_request server={} method={}",
+            server_name, method
+        ));
+        let control = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "mcp_message",
+                "server_name": server_name,
+                "message": message,
+            },
+        });
+        println!("{}", serde_json::to_string(&control)?);
+        std::io::stdout().flush()?;
+        let mcp_response = wait_for_mcp_control_response(input, sdk_state, &request_id).await?;
+        writeln!(
+            stream,
+            "{}",
+            serde_json::to_string(&json!({ "mcp_response": mcp_response }))?
+        )?;
+        stream.flush()?;
+    }
+}
+
+#[cfg(not(unix))]
+async fn service_pending_mcp_proxy_requests_for_runtime(
+    _input: &mut mpsc::Receiver<Value>,
+    _runtime: &SdkMcpRuntime,
+    _sdk_state: &mut SdkStreamState,
+) -> Result<()> {
+    Ok(())
+}
+
+async fn wait_for_mcp_control_response(
+    input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
+    request_id: &str,
+) -> Result<Value> {
+    loop {
+        let next = tokio::time::timeout(MCP_PROXY_RESPONSE_TIMEOUT, input.recv())
+            .await
+            .map_err(|_| CcttyError::Timeout("timed out waiting for SDK MCP response".to_owned()))?
+            .ok_or_else(|| {
+                CcttyError::Usage("stdin closed while waiting for SDK MCP response".to_owned())
+            })?;
+        if next.get("type").and_then(Value::as_str) == Some("control_response") {
+            let response = next.get("response").unwrap_or(&Value::Null);
+            if response.get("request_id").and_then(Value::as_str) == Some(request_id) {
+                if response.get("subtype").and_then(Value::as_str) == Some("error") {
+                    let message = response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("SDK MCP request failed");
+                    return Err(CcttyError::Usage(message.to_owned()));
+                }
+                return Ok(response
+                    .get("response")
+                    .and_then(|body| body.get("mcp_response"))
+                    .cloned()
+                    .unwrap_or(Value::Null));
+            }
+        }
+        sdk_state.deferred_input.push_back(next);
+    }
+}
+
+async fn handle_control_request(
+    process: &mut PtyProcess,
+    _input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
+    _spawn: &StreamSpawnContext<'_>,
+    value: &Value,
+) -> Result<()> {
     let request_id = value
         .get("request_id")
         .and_then(Value::as_str)
@@ -235,9 +906,11 @@ fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()>
         .and_then(|request| request.get("subtype"))
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-
     let response = match subtype {
-        "initialize" => control_success(request_id, sdk_initialize_response()),
+        "initialize" => {
+            sdk_state.add_sdk_mcp_servers(sdk_mcp_servers_from_initialize(value));
+            control_success(request_id, sdk_initialize_response())
+        }
         "interrupt" => {
             process.interrupt()?;
             control_success(request_id, Value::Null)
@@ -246,7 +919,10 @@ fn handle_control_request(process: &mut PtyProcess, value: &Value) -> Result<()>
         "set_permission_mode" => control_success(request_id, Value::Null),
         "set_max_thinking_tokens" => control_success(request_id, Value::Null),
         "apply_flag_settings" => control_success(request_id, Value::Null),
-        "mcp_status" => control_success(request_id, json!({ "mcpServers": [] })),
+        "get_context_usage" => {
+            control_success(request_id, json!({ "total": 0, "used": 0, "remaining": 0 }))
+        }
+        "mcp_status" => control_success(request_id, sdk_state.mcp_status()),
         _ => control_error(
             request_id,
             format!("Unsupported control request: {subtype}"),
@@ -322,6 +998,7 @@ async fn submit_prompt_and_tail_stream(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
     input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
     prompt: &str,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
@@ -333,6 +1010,7 @@ async fn submit_prompt_and_tail_stream(
         process,
         tail,
         input,
+        sdk_state,
         output_format,
         permission_prompt_tool_stdio,
         include_partial_messages,
@@ -425,6 +1103,7 @@ async fn tail_until_complete_stream(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
     input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
     include_partial_messages: bool,
@@ -443,7 +1122,7 @@ async fn tail_until_complete_stream(
                 "timed out waiting for Claude transcript".to_owned(),
             ));
         }
-
+        service_pending_mcp_proxy_requests(input, sdk_state).await?;
         if let Some(path) = tail.resolve_path()? {
             match read_complete_lines(&path, tail.offset).await {
                 Ok((lines, consumed)) if consumed > 0 => {
@@ -796,6 +1475,9 @@ impl PermissionBridge {
 
         let mut requested = false;
         for tool_use in tool_uses_from_assistant(transcript) {
+            if is_mcp_tool_use(&tool_use.name) {
+                continue;
+            }
             if !self.requested_tool_use_ids.insert(tool_use.id.clone()) {
                 continue;
             }
@@ -1217,6 +1899,10 @@ fn split_question_option(value: &str) -> (String, String) {
 
 fn is_file_tool(name: &str) -> bool {
     matches!(name, "Write" | "Edit" | "MultiEdit")
+}
+
+fn is_mcp_tool_use(name: &str) -> bool {
+    name.starts_with("mcp__")
 }
 
 fn normalize_tool_command(command: &str) -> String {
@@ -2123,8 +2809,73 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
+        if tty_output_has_bad_resume_startup_error(&output) {
+            let recent = recent_tty_log_text(&output, 600);
+            logging::event(format!("tty_startup_bad_resume recent={recent}"));
+            return Err(CcttyError::Tty(recent));
+        }
         if tty_output_accepts_prompt(&output) {
             tokio::time::sleep(TTY_READY_SETTLE).await;
+            return Ok(());
+        }
+        if started.elapsed() > TTY_STARTUP_TIMEOUT {
+            let recent = plain_tty_output(&process.recent_output());
+            let recent = recent
+                .chars()
+                .rev()
+                .take(600)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            logging::event(format!("tty_startup_timeout recent={recent}"));
+            return Err(CcttyError::Timeout(format!(
+                "timed out waiting for Claude prompt; recent tty output: {recent}"
+            )));
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+}
+
+async fn prepare_tty_for_prompt_with_mcp(
+    process: &mut PtyProcess,
+    input: &mut mpsc::Receiver<Value>,
+    runtime: &SdkMcpRuntime,
+    sdk_state: &mut SdkStreamState,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut trust_prompt_ack_sent = false;
+    let mut startup_choice_ack_sent = false;
+    let mut auto_mode_ack_sent = false;
+    loop {
+        service_pending_mcp_proxy_requests_for_runtime(input, runtime, sdk_state).await?;
+        let output = process.recent_output();
+        if tty_output_has_workspace_trust_prompt(&output) && !trust_prompt_ack_sent {
+            process.write_all(b"\r")?;
+            trust_prompt_ack_sent = true;
+            tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
+            continue;
+        }
+        if tty_output_has_startup_choice_prompt(&output) && !startup_choice_ack_sent {
+            process.write_all(b"\r")?;
+            startup_choice_ack_sent = true;
+            tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
+            continue;
+        }
+        if tty_output_has_auto_mode_consent_prompt(&output) && !auto_mode_ack_sent {
+            process.write_all(b"2\r")?;
+            auto_mode_ack_sent = true;
+            tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
+            continue;
+        }
+        if tty_output_has_bad_resume_startup_error(&output) {
+            let recent = recent_tty_log_text(&output, 600);
+            logging::event(format!("tty_startup_bad_resume recent={recent}"));
+            return Err(CcttyError::Tty(recent));
+        }
+        if tty_output_accepts_prompt(&output) {
+            tokio::time::sleep(TTY_READY_SETTLE).await;
+            service_pending_mcp_proxy_requests_for_runtime(input, runtime, sdk_state).await?;
             return Ok(());
         }
         if started.elapsed() > TTY_STARTUP_TIMEOUT {
@@ -2165,6 +2916,13 @@ fn tty_output_has_auto_mode_consent_prompt(output: &str) -> bool {
     (output.contains("auto mode") || compact.contains("automode"))
         && (output.contains("Yes, enable auto mode") || compact.contains("Yes,enableautomode"))
         && (output.contains("No, exit") || compact.contains("No,exit"))
+}
+
+fn tty_output_has_bad_resume_startup_error(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let lower = output.to_ascii_lowercase();
+    (lower.contains("session id") && lower.contains("already in use"))
+        || lower.contains("no conversation found with session id")
 }
 
 fn tty_output_accepts_prompt(output: &str) -> bool {
@@ -2379,15 +3137,152 @@ where
 }
 
 fn resolve_claude_path() -> Result<String> {
-    if let Some(path) = std::env::var_os("CCTTY_CLAUDE_PATH") {
-        let path = path.to_string_lossy().to_string();
-        if !path.trim().is_empty() {
+    let own_exe = std::env::current_exe().ok();
+    let current_dir = std::env::current_dir().ok();
+    resolve_claude_path_from(
+        own_exe.as_deref(),
+        current_dir.as_deref(),
+        std::env::var_os("CCTTY_CLAUDE_PATH"),
+        std::env::var_os("CONDUCTOR_AGENT_BINARIES_DIR"),
+        std::env::var_os("PATH"),
+    )
+}
+
+fn resolve_claude_path_from(
+    own_exe: Option<&Path>,
+    current_dir: Option<&Path>,
+    explicit_path: Option<OsString>,
+    conductor_agent_binaries_dir: Option<OsString>,
+    path_env: Option<OsString>,
+) -> Result<String> {
+    let own_exe = own_exe.and_then(canonical_path);
+    if let Some(path) = explicit_path
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return usable_claude_candidate(&path, own_exe.as_deref()).ok_or_else(|| {
+            CcttyError::ClaudeNotFound(format!(
+                "CCTTY_CLAUDE_PATH points to unusable Claude binary: {}",
+                path.display()
+            ))
+        });
+    }
+
+    for candidate in current_dir_claude_candidates(current_dir) {
+        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
+            logging::event(format!("claude_resolved source=current_dir path={path}"));
             return Ok(path);
         }
     }
-    which::which("claude")
-        .map(|path| path.to_string_lossy().to_string())
-        .map_err(|error| CcttyError::ClaudeNotFound(error.to_string()))
+
+    for candidate in relative_claude_candidates(own_exe.as_deref()) {
+        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
+            logging::event(format!("claude_resolved source=relative path={path}"));
+            return Ok(path);
+        }
+    }
+
+    for candidate in conductor_agent_binary_candidates(conductor_agent_binaries_dir) {
+        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
+            logging::event(format!("claude_resolved source=conductor path={path}"));
+            return Ok(path);
+        }
+    }
+
+    for candidate in path_claude_candidates(path_env) {
+        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
+            logging::event(format!("claude_resolved source=path path={path}"));
+            return Ok(path);
+        }
+    }
+
+    Err(CcttyError::ClaudeNotFound(
+        "no usable real Claude binary found via CCTTY_CLAUDE_PATH, current directory, cctty-relative paths, Conductor agent-binaries, or PATH"
+            .to_owned(),
+    ))
+}
+
+fn current_dir_claude_candidates(current_dir: Option<&Path>) -> Vec<PathBuf> {
+    let Some(dir) = current_dir else {
+        return Vec::new();
+    };
+    ["claude.real", "claude.orig", "claude-code", "claude"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .collect()
+}
+
+fn relative_claude_candidates(own_exe: Option<&Path>) -> Vec<PathBuf> {
+    let Some(dir) = own_exe.and_then(Path::parent) else {
+        return Vec::new();
+    };
+    [
+        "claude.real",
+        "claude.orig",
+        "claude-code",
+        "claude",
+        "../claude/claude",
+        "../claude-code/claude",
+        "../vendor/claude-code/claude",
+    ]
+    .into_iter()
+    .map(|name| dir.join(name))
+    .collect()
+}
+
+fn conductor_agent_binary_candidates(dir: Option<OsString>) -> Vec<PathBuf> {
+    let Some(root) = dir.map(PathBuf::from).filter(|path| path.is_dir()) else {
+        return Vec::new();
+    };
+    let claude_root = root.join("claude");
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&claude_root) {
+        for entry in entries.flatten() {
+            candidates.push(entry.path().join("claude"));
+        }
+    }
+    candidates.sort_by(|left, right| right.cmp(left));
+    candidates
+}
+
+fn path_claude_candidates(path_env: Option<OsString>) -> Vec<PathBuf> {
+    path_env
+        .map(|value| {
+            std::env::split_paths(&value)
+                .map(|dir| dir.join("claude"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn usable_claude_candidate(path: &Path, own_exe: Option<&Path>) -> Option<String> {
+    let canonical = canonical_path(path)?;
+    if own_exe.is_some_and(|own| own == canonical) {
+        return None;
+    }
+    is_executable_file(&canonical).then(|| canonical.to_string_lossy().to_string())
+}
+
+fn canonical_path(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 struct TailCursor {
@@ -2440,6 +3335,13 @@ impl TailCursor {
         }
         let _ = &self.config_dir;
         Ok(self.path.clone())
+    }
+
+    fn reset_for_new_session(&mut self) {
+        self.path = None;
+        self.offset = 0;
+        self.attach_existing = false;
+        self.started_at = SystemTime::now();
     }
 
     fn remove_current_transcript(&self) -> Result<()> {
@@ -2538,6 +3440,79 @@ mod tests {
             output,
             "Write a compact document for SDK users"
         ));
+    }
+
+    #[test]
+    fn strips_session_resume_args_for_startup_retry() {
+        let args = vec![
+            "--model".to_owned(),
+            "sonnet".to_owned(),
+            "--resume-session-at".to_owned(),
+            "message-1".to_owned(),
+            "--session-id=locked-session".to_owned(),
+            "--continue".to_owned(),
+            "--permission-mode".to_owned(),
+            "default".to_owned(),
+        ];
+        assert_eq!(
+            strip_session_resume_args(&args),
+            vec![
+                "--model".to_owned(),
+                "sonnet".to_owned(),
+                "--permission-mode".to_owned(),
+                "default".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_real_claude_from_current_directory_before_path() {
+        let current = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let own = current.path().join("cctty");
+        let current_claude = current.path().join("claude");
+        let path_claude = path_dir.path().join("claude");
+        write_executable(&own);
+        write_executable(&current_claude);
+        write_executable(&path_claude);
+
+        let resolved = resolve_claude_path_from(
+            Some(&own),
+            Some(current.path()),
+            None,
+            None,
+            Some(OsString::from(path_dir.path().as_os_str())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(current_claude)
+                .unwrap()
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn skips_cctty_itself_when_resolving_path_claude() {
+        let current = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let own = current.path().join("claude");
+        let path_claude = path_dir.path().join("claude");
+        write_executable(&own);
+        write_executable(&path_claude);
+        let path_env = std::env::join_paths([current.path(), path_dir.path()]).unwrap();
+
+        let resolved =
+            resolve_claude_path_from(Some(&own), Some(current.path()), None, None, Some(path_env))
+                .unwrap();
+
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(path_claude)
+                .unwrap()
+                .to_string_lossy()
+        );
     }
 
     #[test]
@@ -2684,5 +3659,16 @@ mod tests {
             bash_command_from_tty_permission_prompt(output).as_deref(),
             Some("echo tty fake")
         );
+    }
+
+    fn write_executable(path: &Path) {
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
     }
 }

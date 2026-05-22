@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 mod support;
@@ -199,6 +199,74 @@ fn passes_agent_definition_flags_to_underlying_claude_tty() {
 }
 
 #[test]
+fn passes_mcp_flags_to_underlying_claude_tty() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let mcp_config =
+        r#"{"mcpServers":{"docs":{"type":"stdio","command":"node","args":["server.js"]}}}"#;
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--mcp-config",
+            mcp_config,
+            "--strict-mcp-config",
+            "--mcp-debug",
+            "Check MCP",
+        ])
+        .assert()
+        .success();
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--mcp-config", mcp_config])
+    );
+    let mcp_config_arg = argv
+        .windows(2)
+        .find(|pair| pair[0] == "--mcp-config")
+        .map(|pair| pair[1].clone())
+        .expect("expected --mcp-config to be passed to fake Claude");
+    assert_eq!(mcp_config_arg, mcp_config);
+    let proxy_marker = ["__cctty", "mcp", "proxy"].join("-");
+    assert!(!mcp_config_arg.contains(&proxy_marker));
+    assert!(argv.iter().any(|arg| arg == "--strict-mcp-config"));
+    assert!(argv.iter().any(|arg| arg == "--mcp-debug"));
+}
+
+#[test]
+fn runs_underlying_claude_in_cctty_current_directory() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let cwd_path = tempfile::NamedTempFile::new().unwrap();
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_CWD_PATH", cwd_path.path())
+        .current_dir(workspace.path())
+        .args(["--print", "--output-format", "stream-json", "Check cwd"])
+        .assert()
+        .success();
+
+    let cwd = std::fs::read_to_string(cwd_path.path()).unwrap();
+    let expected = std::fs::canonicalize(workspace.path()).unwrap();
+    assert_eq!(std::path::Path::new(cwd.trim()), expected.as_path());
+}
+
+#[test]
 fn no_session_persistence_removes_generated_transcript() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -365,6 +433,242 @@ fn stream_json_accepts_wrapper_control_requests_after_initialize() {
 }
 
 #[test]
+fn stream_json_metadata_control_requests_do_not_wait_for_tty_prompt() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_STARTUP_DELAY_MS", "1500")
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let started = Instant::now();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "metadata-init",
+            "request": { "subtype": "initialize" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "initialize waited for TTY startup: {line}"
+    );
+    let response: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(response["response"]["request_id"], "metadata-init");
+    line.clear();
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "metadata-mcp",
+            "request": { "subtype": "mcp_status" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    reader.read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(response["response"]["request_id"], "metadata-mcp");
+    assert_eq!(
+        response["response"]["response"]["mcpServers"],
+        Value::Array(vec![])
+    );
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_ts_sdk_mcp_server_round_trips_tool_calls() {
+    assert_sdk_mcp_server_round_trips_tool_calls(
+        Vec::new(),
+        serde_json::json!({ "subtype": "initialize", "sdkMcpServers": ["conductor"], "systemPrompt": [""] }),
+    );
+}
+
+#[test]
+fn stream_json_python_sdk_mcp_config_round_trips_tool_calls() {
+    assert_sdk_mcp_server_round_trips_tool_calls(
+        vec![
+            "--mcp-config".to_owned(),
+            serde_json::json!({ "mcpServers": { "conductor": { "type": "sdk", "name": "conductor" } } }).to_string(),
+            "--strict-mcp-config".to_owned(),
+        ],
+        serde_json::json!({ "subtype": "initialize", "hooks": null }),
+    );
+}
+
+fn assert_sdk_mcp_server_round_trips_tool_calls(extra_args: Vec<String>, initialize: Value) {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000014";
+    let mut args = vec![
+        "--output-format".to_owned(),
+        "stream-json".to_owned(),
+        "--input-format".to_owned(),
+        "stream-json".to_owned(),
+        "--permission-prompt-tool".to_owned(),
+        "stdio".to_owned(),
+        "--session-id".to_owned(),
+        session_id.to_owned(),
+    ];
+    args.extend(extra_args);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(stdin, "{}", serde_json::json!({ "type": "control_request", "request_id": "init-mcp-1", "request": initialize })).unwrap();
+    stdin.flush().unwrap();
+
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let init_response: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(init_response["type"], "control_response");
+    assert_eq!(init_response["response"]["request_id"], "init-mcp-1");
+    line.clear();
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_FAKE_SDK_MCP_ASK"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut methods = Vec::new();
+    let mut final_result = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                assert_eq!(value["request"]["subtype"], "mcp_message");
+                assert_eq!(value["request"]["server_name"], "conductor");
+                let request_id = value["request_id"].as_str().unwrap();
+                let message = &value["request"]["message"];
+                let method = message["method"].as_str().unwrap_or_default();
+                let id = message["id"].clone();
+                if method != "notifications/initialized" {
+                    methods.push(method.to_owned());
+                }
+                let mcp_response = match method {
+                    "initialize" => {
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": { "listChanged": true } }, "serverInfo": { "name": "conductor", "version": "test" } } })
+                    }
+                    "notifications/initialized" => {
+                        serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": {} })
+                    }
+                    "tools/list" => {
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [{ "name": "AskUserQuestion", "description": "Ask the user a structured question", "inputSchema": { "type": "object", "properties": { "questions": { "type": "array" } } } }] } })
+                    }
+                    "tools/call" => {
+                        assert_eq!(message["params"]["name"], "AskUserQuestion");
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "User responses:\n- Document type: Technical design\n- Audience: SDK users" }] } })
+                    }
+                    other => panic!("unexpected MCP method {other}: {value}"),
+                };
+                writeln!(stdin, "{}", serde_json::json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": { "mcp_response": mcp_response } } })).unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                final_result = value["result"].as_str().unwrap_or_default().to_owned();
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        methods,
+        ["initialize", "tools/list", "tools/call"],
+        "final_result={final_result}"
+    );
+    assert!(
+        final_result.contains("User responses:"),
+        "final_result={final_result}"
+    );
+    assert!(
+        final_result.contains("Technical design"),
+        "final_result={final_result}"
+    );
+    assert!(
+        final_result.contains("SDK users"),
+        "final_result={final_result}"
+    );
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    let mcp_config_arg = argv
+        .windows(2)
+        .find(|pair| pair[0] == "--mcp-config")
+        .map(|pair| pair[1].clone())
+        .expect("expected rewritten --mcp-config to be passed to fake Claude");
+    assert!(
+        mcp_config_arg.contains("__cctty-mcp-proxy"),
+        "{mcp_config_arg}"
+    );
+    assert!(
+        !mcp_config_arg.contains(r#""type":"sdk""#),
+        "{mcp_config_arg}"
+    );
+}
+
+#[test]
 fn stream_json_include_partial_messages_emits_text_stream_events() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -424,6 +728,143 @@ fn stream_json_include_partial_messages_emits_text_stream_events() {
     );
     assert!(values.iter().any(|value| value["type"] == "assistant"));
     assert!(values.iter().any(|value| value["type"] == "result"));
+}
+
+#[test]
+fn stream_json_recovers_from_claude_session_in_use_startup_error() {
+    assert_stream_json_recovers_from_bad_resume_startup("1");
+}
+
+#[test]
+fn stream_json_recovers_from_claude_missing_resume_startup_error() {
+    assert_stream_json_recovers_from_bad_resume_startup("no_conversation");
+}
+
+#[test]
+fn stream_json_handles_multiple_user_messages_in_one_sdk_process() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--session-id",
+            "00000000-0000-0000-0000-000000000013",
+            "--permission-mode",
+            "default",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for prompt in ["First stream prompt", "Second stream prompt"] {
+            writeln!(
+                stdin,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                    "session_id": "conductor-session-1",
+                })
+            )
+            .unwrap();
+        }
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        panic!("cctty did not exit after stdin closed");
+    }
+    assert!(status.unwrap().success());
+
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert!(
+        stdout.contains("FAKE_RESPONSE: First stream prompt"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FAKE_RESPONSE: Second stream prompt"),
+        "{stdout}"
+    );
+    let results = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["type"] == "result")
+        .count();
+    assert_eq!(results, 2, "{stdout}");
+}
+
+fn assert_stream_json_recovers_from_bad_resume_startup(fake_failure: &str) {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_FAIL_SESSION_ARGS", fake_failure)
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--resume-session-at",
+            "message-1",
+            "--model",
+            "sonnet",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"type":"user","message":{{"role":"user","content":"Recover please"}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait_timeout(Duration::from_secs(10)).unwrap();
+    if status.is_none() {
+        let _ = child.kill();
+        panic!("cctty did not exit after stdin closed");
+    }
+    assert!(status.unwrap().success());
+
+    let mut stdout = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut stdout).unwrap();
+    assert!(stdout.contains("FAKE_RESPONSE: Recover please"), "{stdout}");
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        !argv.iter().any(|arg| arg == "--resume-session-at"),
+        "retry should strip resume/session args that make interactive Claude report a session lock: {argv:?}"
+    );
+    assert!(argv.windows(2).any(|pair| pair == ["--model", "sonnet"]));
 }
 
 #[test]
