@@ -47,7 +47,11 @@ impl PtyProcess {
     }
 
     pub fn kill(&mut self) {
+        if self.pid <= 0 {
+            return;
+        }
         unsafe {
+            libc::kill(-self.pid, libc::SIGTERM);
             libc::kill(self.pid, libc::SIGTERM);
         }
     }

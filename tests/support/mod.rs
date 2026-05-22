@@ -30,6 +30,8 @@ import os
 from pathlib import Path
 import select
 import sys
+import termios
+import tty
 
 argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
 if argv_path:
@@ -97,6 +99,88 @@ while True:
     raw_prompt = buf[start + len(b"\x1b[200~"):end] if start >= 0 else buf[:end]
     prompt = raw_prompt.decode("utf-8", errors="replace")
     response = "FAKE_RESPONSE: " + prompt
+    if "USE_FAKE_ASK_USER_QUESTION" in prompt:
+        question_input = {
+            "questions": [
+                {
+                    "question": "What kind of document do you want?",
+                    "header": "Doc type",
+                    "options": [
+                        {
+                            "label": "Technical design",
+                            "description": "Architecture and implementation details",
+                        },
+                        {
+                            "label": "Product brief",
+                            "description": "Audience, goals, and scope",
+                        },
+                    ],
+                    "multiSelect": False,
+                },
+                {
+                    "question": "Who is the audience?",
+                    "header": "Audience",
+                    "options": [
+                        {
+                            "label": "Developers",
+                            "description": "Engineers integrating the SDK",
+                        },
+                        {
+                            "label": "Operators",
+                            "description": "People running the tool locally",
+                        },
+                    ],
+                    "multiSelect": False,
+                },
+            ]
+        }
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-question-1","name":"AskUserQuestion","input":question_input}]}}) + "\n")
+        sys.stdout.write("← ☐ Doc type ☐ Audience ✔ Submit →\n")
+        sys.stdout.write("What kind of document do you want?\n")
+        sys.stdout.write("❯ 1. Technical design Architecture and implementation details\n")
+        sys.stdout.write("  2. Product brief Audience, goals, and scope\n")
+        sys.stdout.write("  3. Type something.\n")
+        sys.stdout.write("  4. Chat about this\n")
+        sys.stdout.write("Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n")
+        sys.stdout.flush()
+        fd = sys.stdin.fileno()
+        old_termios = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            os.read(0, 4096)
+            sys.stdout.write("What should Claude do instead?\n")
+            sys.stdout.flush()
+            feedback_bytes = b""
+            while True:
+                ready, _, _ = select.select([0], [], [], 2)
+                if not ready:
+                    break
+                feedback_bytes += os.read(0, 4096)
+                if b"\x1b[201~" in feedback_bytes:
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_termios)
+        start_feedback = feedback_bytes.find(b"\x1b[200~")
+        end_feedback = feedback_bytes.find(b"\x1b[201~")
+        if start_feedback >= 0 and end_feedback >= 0:
+            feedback = feedback_bytes[start_feedback + len(b"\x1b[200~"):end_feedback].decode("utf-8", errors="replace")
+        else:
+            feedback = feedback_bytes.decode("utf-8", errors="replace").strip()
+        response = "FAKE_ASK_USER_FEEDBACK: " + feedback
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-question-1","content":feedback}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
     if "USE_TTY_ONLY_FAKE_TOOL" in prompt:
         sys.stdout.write("Bash command echo tty fake Permission rule Bash(echo:*) requires confirmation for this command.\n")
         sys.stdout.write("Do you want to proceed?\n")
