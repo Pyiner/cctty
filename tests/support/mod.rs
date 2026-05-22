@@ -24,18 +24,24 @@ impl FakeClaude {
 fn write_fake_claude_script(path: &Path) {
     fs::write(
         path,
-        r#"#!/usr/bin/env python3
+r#"#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
 import select
+import subprocess
 import sys
 import termios
+import time
 import tty
 
 argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
 if argv_path:
     Path(argv_path).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+
+cwd_path = os.environ.get("FAKE_CLAUDE_CWD_PATH")
+if cwd_path:
+    Path(cwd_path).write_text(str(Path.cwd()), encoding="utf-8")
 
 env_path = os.environ.get("FAKE_CLAUDE_ENV_PATH")
 if env_path:
@@ -62,6 +68,18 @@ if "--help" in sys.argv or "-h" in sys.argv:
     print("  --agents <json>")
     sys.exit(0)
 
+fail_session_args = os.environ.get("FAKE_CLAUDE_FAIL_SESSION_ARGS")
+if fail_session_args:
+    session_flags = ("--session-id", "--resume", "-r", "--continue", "-c", "--resume-session-at")
+    has_session_arg = any(arg in session_flags or arg.startswith("--session-id=") or arg.startswith("--resume=") or arg.startswith("--resume-session-at=") for arg in sys.argv[1:])
+    if has_session_arg:
+        if fail_session_args == "no_conversation":
+            print("No conversation found with session ID: test-session")
+        else:
+            print("Error: Session ID test-session is already in use.")
+        sys.stdout.flush()
+        sys.exit(1)
+
 def arg_value(flag, default=None):
     if flag in sys.argv:
         idx = sys.argv.index(flag)
@@ -78,10 +96,64 @@ def project_key(cwd):
         out.append(ch if ch.isascii() and ch.isalnum() else "-")
     return "".join(out) or "-"
 
+def mcp_server_config(name):
+    raw_config = arg_value("--mcp-config")
+    if not raw_config:
+        raise RuntimeError("missing --mcp-config")
+    config = json.loads(raw_config)
+    server = config.get("mcpServers", {}).get(name)
+    if not server:
+        raise RuntimeError(f"missing MCP server {name}")
+    return server
+
+def call_mcp_tool(server_name, tool_name, arguments):
+    server = mcp_server_config(server_name)
+    command = server.get("command")
+    if not command:
+        raise RuntimeError(f"MCP server {server_name} has no command")
+    args = server.get("args") or []
+    env = os.environ.copy()
+    env.update(server.get("env") or {})
+    proc = subprocess.Popen([command, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+    next_id = 1
+    def request(method, params=None):
+        nonlocal next_id
+        request_id = next_id
+        next_id += 1
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                stderr = proc.stderr.read()
+                raise RuntimeError(f"MCP proxy exited before {method}: {stderr}")
+            response = json.loads(line)
+            if response.get("id") == request_id:
+                if "error" in response:
+                    raise RuntimeError(response["error"])
+                return response.get("result", {})
+
+    request("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "fake-claude", "version": "0"}})
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    proc.stdin.flush()
+    request("tools/list")
+    result = request("tools/call", {"name": tool_name, "arguments": arguments})
+    proc.stdin.close()
+    proc.wait(timeout=5)
+    return result
+
 session_id = arg_value("--session-id") or arg_value("--resume") or "00000000-0000-0000-0000-000000000000"
 config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 transcript = config_dir / "projects" / project_key(Path.cwd()) / f"{session_id}.jsonl"
 transcript.parent.mkdir(parents=True, exist_ok=True)
+
+startup_delay_ms = os.environ.get("FAKE_CLAUDE_STARTUP_DELAY_MS")
+if startup_delay_ms:
+    time.sleep(int(startup_delay_ms) / 1000)
 
 sys.stdout.write("Context permissions /mcp\n")
 sys.stdout.flush()
@@ -294,6 +366,32 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-write-1","name":"Write","input":{"file_path":"index.html","content":"<canvas></canvas>"}}]}}) + "\n")
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-write-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
+    if "USE_FAKE_SDK_MCP_ASK" in prompt:
+        try:
+            mcp_result = call_mcp_tool("conductor", "AskUserQuestion", {
+                "questions": [
+                    {"question": "What kind of document do you want?"},
+                    {"question": "Who is the audience?"},
+                ]
+            })
+            content = mcp_result.get("content", [])
+            response = "\n".join(item.get("text", "") for item in content if item.get("type") == "text")
+        except Exception as exc:
+            response = f"MCP_EXCEPTION: {exc!r}"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"mcp-tool-1","name":"mcp__conductor__AskUserQuestion","input":{"questions":[{"question":"What kind of document do you want?"}]}}]}}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"mcp-tool-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
         sys.stdout.write("Context permissions /mcp\n")

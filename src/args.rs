@@ -309,9 +309,19 @@ fn flag_arity(arg: &str) -> FlagArity {
     match flag {
         "--add-dir" | "--allowedTools" | "--allowed-tools" | "--betas" | "--disallowedTools"
         | "--disallowed-tools" | "--file" | "--mcp-config" | "--tools" => FlagArity::Many,
+        "--channels" | "--dangerously-load-development-channels" => FlagArity::Many,
         "--agent"
+        | "--advisor"
+        | "--agent-color"
+        | "--agent-id"
+        | "--agent-name"
+        | "--agent-type"
         | "--agents"
         | "--append-system-prompt"
+        | "--append-system-prompt-file"
+        | "--deep-link-cwd-b64"
+        | "--deep-link-last-fetch"
+        | "--deep-link-repo"
         | "--debug-file"
         | "--effort"
         | "--fallback-model"
@@ -323,22 +333,30 @@ fn flag_arity(arg: &str) -> FlagArity {
         | "--model"
         | "--name"
         | "-n"
+        | "--parent-session-id"
         | "--permission-mode"
         | "--permission-prompt-tool"
+        | "--plan-mode-instructions"
         | "--plugin-dir"
         | "--plugin-url"
+        | "--prefill"
+        | "--prefill-b64"
+        | "--rewind-files"
         | "--resume-session-at"
         | "--remote-control-session-name-prefix"
+        | "--sdk-url"
         | "--setting-sources"
         | "--settings"
         | "--system-prompt"
         | "--system-prompt-file"
         | "--task-budget"
+        | "--team-name"
+        | "--teammate-mode"
         | "--thinking"
-        | "--thinking-display" => FlagArity::One,
-        "--debug" | "-d" | "--from-pr" | "--remote-control" | "--worktree" | "-w" => {
-            FlagArity::Optional
-        }
+        | "--thinking-display"
+        | "--workload" => FlagArity::One,
+        "--debug" | "-d" | "--from-pr" | "--rc" | "--remote" | "--remote-control"
+        | "--teleport" | "--worktree" | "-w" => FlagArity::Optional,
         _ => FlagArity::None,
     }
 }
@@ -494,6 +512,40 @@ mod tests {
                     .any(|pair| pair == ["--permission-mode", mode]),
                 "permission mode {mode} was not passed through"
             );
+        }
+    }
+
+    #[test]
+    fn parse_passes_hidden_sdk_and_native_option_shapes() {
+        for case in hidden_sdk_and_native_option_cases() {
+            let mut argv = vec![
+                "cctty".to_owned(),
+                "--output-format".to_owned(),
+                "stream-json".to_owned(),
+            ];
+            argv.extend(case.argv.iter().map(|value| value.to_string()));
+            argv.push("--input-format".to_owned());
+            argv.push("stream-json".to_owned());
+
+            let invocation = Invocation::parse(argv)
+                .unwrap_or_else(|error| panic!("{} failed to parse: {error}", case.name));
+            assert_eq!(
+                invocation.input_format,
+                InputFormat::StreamJson,
+                "{} swallowed --input-format",
+                case.name
+            );
+            for expected in case.expected_passthrough {
+                assert!(
+                    invocation
+                        .passthrough_args
+                        .iter()
+                        .any(|arg| arg == expected),
+                    "{} did not pass through {expected:?}; got {:?}",
+                    case.name,
+                    invocation.passthrough_args
+                );
+            }
         }
     }
 
@@ -726,6 +778,68 @@ mod tests {
             pass("--version", &["--version"]),
             pass("-w", &["-w", "synthetic-worktree"]),
             pass("--worktree", &["--worktree", "synthetic-worktree"]),
+        ]
+    }
+
+    fn hidden_sdk_and_native_option_cases() -> Vec<OptionCase> {
+        vec![
+            pass("--advisor", &["--advisor", "sonnet"]),
+            pass("--agent-color", &["--agent-color", "blue"]),
+            pass("--agent-id", &["--agent-id", "agent_0000000000000000"]),
+            pass("--agent-name", &["--agent-name", "Test Agent"]),
+            pass("--agent-type", &["--agent-type", "reviewer"]),
+            pass(
+                "--append-system-prompt-file",
+                &["--append-system-prompt-file", "append.md"],
+            ),
+            pass("--channels", &["--channels", "server-a", "server-b"]),
+            pass("--cowork", &["--cowork"]),
+            pass(
+                "--dangerously-load-development-channels",
+                &[
+                    "--dangerously-load-development-channels",
+                    "server-a",
+                    "server-b",
+                ],
+            ),
+            pass("--deep-link-cwd-b64", &["--deep-link-cwd-b64", "L3RtcA=="]),
+            pass("--deep-link-last-fetch", &["--deep-link-last-fetch", "0"]),
+            pass("--deep-link-origin", &["--deep-link-origin"]),
+            pass("--deep-link-repo", &["--deep-link-repo", "owner/repo"]),
+            pass("--enable-auth-status", &["--enable-auth-status"]),
+            pass("--enable-auto-mode", &["--enable-auto-mode"]),
+            pass("--init", &["--init"]),
+            pass("--init-only", &["--init-only"]),
+            pass("--maintenance", &["--maintenance"]),
+            pass("--managed-settings", &["--managed-settings", "{}"]),
+            pass("--max-thinking-tokens", &["--max-thinking-tokens", "1024"]),
+            pass("--max-turns", &["--max-turns", "1"]),
+            pass("--parent-session-id", &["--parent-session-id", "parent-1"]),
+            pass(
+                "--plan-mode-instructions",
+                &["--plan-mode-instructions", "Write a short plan first"],
+            ),
+            pass("--plan-mode-required", &["--plan-mode-required"]),
+            pass("--prefill", &["--prefill", "Draft text"]),
+            pass("--prefill-b64", &["--prefill-b64", "RHJhZnQ="]),
+            pass("--rc", &["--rc", "mobile"]),
+            pass("--remote", &["--remote", "session"]),
+            pass("--resume-session-at", &["--resume-session-at", "message-1"]),
+            pass("--rewind-files", &["--rewind-files", "message-1"]),
+            pass("--sdk-url", &["--sdk-url", "ws://127.0.0.1:1234"]),
+            pass("--session-mirror", &["--session-mirror"]),
+            pass(
+                "--system-prompt-file",
+                &["--system-prompt-file", "system.md"],
+            ),
+            pass("--task-budget", &["--task-budget", "2048"]),
+            pass("--team-name", &["--team-name", "Test Team"]),
+            pass("--teammate-mode", &["--teammate-mode", "auto"]),
+            pass("--teleport", &["--teleport", "session-1"]),
+            pass("--thinking", &["--thinking", "adaptive"]),
+            pass("--thinking-display", &["--thinking-display", "full"]),
+            pass("--workload", &["--workload", "test-workload"]),
+            pass("--xaa", &["--xaa"]),
         ]
     }
 

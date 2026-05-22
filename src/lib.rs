@@ -8,6 +8,10 @@ mod transcript;
 pub use error::{CcttyError, Result};
 
 pub async fn run_cli(argv: Vec<String>) -> Result<i32> {
+    if argv.get(1).map(String::as_str) == Some("__cctty-mcp-proxy") {
+        return runner::run_mcp_proxy(argv);
+    }
+
     let invocation = match args::Invocation::parse(argv) {
         Ok(invocation) => invocation,
         Err(error) => {
