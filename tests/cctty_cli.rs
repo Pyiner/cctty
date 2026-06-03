@@ -617,12 +617,15 @@ fn stream_json_sdk_mcp_survives_control_restart_between_turns() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
+    let session_lock_dir = tempfile::tempdir().unwrap();
     let argv_path = tempfile::NamedTempFile::new().unwrap();
     let session_id = "00000000-0000-0000-0000-000000000015";
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
         .env("CCTTY_CLAUDE_PATH", fixture.path())
         .env("CLAUDE_CONFIG_DIR", config_dir.path())
         .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_DIR", session_lock_dir.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_STALE_MS", "650")
         .current_dir(workspace.path())
         .args([
             "--output-format",
@@ -1008,11 +1011,6 @@ fn stream_json_include_partial_messages_emits_text_stream_events() {
 }
 
 #[test]
-fn stream_json_recovers_from_claude_session_in_use_startup_error() {
-    assert_stream_json_recovers_from_bad_resume_startup("1");
-}
-
-#[test]
 fn stream_json_recovers_from_claude_missing_resume_startup_error() {
     assert_stream_json_recovers_from_bad_resume_startup("no_conversation");
 }
@@ -1389,6 +1387,97 @@ fn stream_json_permission_prompt_stdio_maps_denial_to_keyboard_form() {
         "expected can_use_tool control_request"
     );
     assert!(saw_denied_result, "expected denied fake tool result");
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_permission_prompt_stdio_allows_generic_tty_permission_form() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000016";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_TTY_GENERIC_TOOL_PERMISSION"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut saw_permission_request = false;
+    let mut saw_allowed_result = false;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                saw_permission_request = true;
+                assert_eq!(
+                    value["request"]["tool_name"],
+                    Value::String("ToolSearch".to_owned())
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow"
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                saw_allowed_result = value["result"] == "FAKE_GENERIC_TOOL_ALLOWED";
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert!(
+        saw_permission_request,
+        "expected can_use_tool control_request"
+    );
+    assert!(saw_allowed_result, "expected allowed generic tool result");
     let status = child
         .wait_timeout(Duration::from_secs(5))
         .unwrap()

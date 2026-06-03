@@ -52,8 +52,9 @@ impl PtyProcess {
             return;
         }
         unsafe {
-            libc::kill(-self.pid, libc::SIGTERM);
-            libc::kill(self.pid, libc::SIGTERM);
+            if libc::kill(-self.pid, libc::SIGTERM) != 0 {
+                libc::kill(self.pid, libc::SIGTERM);
+            }
         }
     }
 
@@ -73,8 +74,9 @@ impl PtyProcess {
             }
             if started.elapsed() >= timeout {
                 unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                    libc::kill(pid, libc::SIGKILL);
+                    if libc::kill(-pid, libc::SIGKILL) != 0 {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
                     libc::waitpid(pid, &mut status, 0);
                 }
                 self.pid = 0;

@@ -153,18 +153,54 @@ config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude
 transcript = config_dir / "projects" / project_key(Path.cwd()) / f"{session_id}.jsonl"
 transcript.parent.mkdir(parents=True, exist_ok=True)
 
+def lock_deadline_elapsed(started_ms):
+    stale_ms = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_STALE_MS")
+    if not stale_ms:
+        return False
+    return int(time.time() * 1000) >= started_ms + int(stale_ms)
+
 session_lock_dir = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_DIR")
 session_lock_path = None
 if session_lock_dir:
     session_lock_path = Path(session_lock_dir) / f"{session_id}.lock"
     session_lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if session_lock_path.exists():
+    def fail_session_locked():
         print(f"Error: Session ID {session_id} is already in use.")
         sys.stdout.flush()
         sys.exit(1)
-    session_lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    if session_lock_path.exists():
+        raw_lock = session_lock_path.read_text(encoding="utf-8").strip()
+        stale_prefix = "stale-until:"
+        running_prefix = "running:"
+        if raw_lock.startswith(stale_prefix):
+            stale_until_ms = int(raw_lock[len(stale_prefix):])
+            if int(time.time() * 1000) >= stale_until_ms:
+                session_lock_path.unlink()
+            else:
+                fail_session_locked()
+        elif raw_lock.startswith(running_prefix):
+            parts = raw_lock[len(running_prefix):].split(":", 1)
+            started_ms = int(parts[1]) if len(parts) > 1 else int(session_lock_path.stat().st_mtime * 1000)
+            if lock_deadline_elapsed(started_ms):
+                session_lock_path.unlink()
+            else:
+                fail_session_locked()
+        else:
+            fail_session_locked()
+    session_lock_path.write_text(f"running:{os.getpid()}:{int(time.time() * 1000)}", encoding="utf-8")
+    session_lock_released = False
 
     def release_session_lock():
+        global session_lock_released
+        if session_lock_released:
+            return
+        session_lock_released = True
+        stale_ms = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_STALE_MS")
+        if stale_ms:
+            stale_until_ms = int(time.time() * 1000) + int(stale_ms)
+            session_lock_path.write_text(f"stale-until:{stale_until_ms}", encoding="utf-8")
+            return
         delay_ms = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_RELEASE_DELAY_MS")
         if delay_ms:
             time.sleep(int(delay_ms) / 1000)
@@ -396,6 +432,33 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-write-1","name":"Write","input":{"file_path":"index.html","content":"<canvas></canvas>"}}]}}) + "\n")
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-write-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
+    if "USE_TTY_GENERIC_TOOL_PERMISSION" in prompt:
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-search-1","name":"ToolSearch","input":{"query":"select:mcp__conductor__ask_user_question"}}]}}) + "\n")
+        sys.stdout.write("Permission required to load a deferred tool\n")
+        sys.stdout.write("Do you want to proceed?\n")
+        sys.stdout.write("❯ 1. Yes\n")
+        sys.stdout.write("  2. No\n")
+        sys.stdout.write("Enter to confirm · Esc to cancel\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        if b"1" in ack and not ack.startswith(b"\x1b"):
+            response = "FAKE_GENERIC_TOOL_ALLOWED"
+        else:
+            response = "FAKE_GENERIC_TOOL_DENIED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-search-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
         sys.stdout.write("Context permissions /mcp\n")

@@ -28,6 +28,8 @@ const TTY_PERMISSION_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
 const TTY_QUESTION_FORM_SETTLE: Duration = Duration::from_millis(250);
 const MCP_PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const PTY_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
+const TTY_SESSION_LOCK_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
+const TTY_SESSION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(300);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -124,6 +126,9 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
     };
     let env = interactive_claude_env();
     let mut passthrough_args = invocation.passthrough_args.clone();
+    if invocation.permission_prompt_tool_stdio {
+        passthrough_args = allow_bridged_ask_user_question_tool(&passthrough_args);
+    }
     let mut current_session_id = session_id.clone();
     let mut attach_existing = invocation.continue_conversation;
     let mut transcript = transcript;
@@ -136,7 +141,17 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         &invocation,
     )?;
     if invocation.input_format == InputFormat::Text {
-        if let Err(error) = prepare_tty_for_prompt(&mut process).await {
+        if let Err(error) = prepare_tty_for_prompt_retrying_session_lock(
+            &mut process,
+            &claude,
+            &cwd,
+            &env,
+            &passthrough_args,
+            &current_session_id,
+            &invocation,
+        )
+        .await
+        {
             if is_bad_resume_startup_error(&error) {
                 let stripped_args = strip_session_resume_args(&passthrough_args);
                 if stripped_args != passthrough_args {
@@ -154,7 +169,16 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
                         &current_session_id,
                         &invocation,
                     )?;
-                    prepare_tty_for_prompt(&mut process).await?;
+                    prepare_tty_for_prompt_retrying_session_lock(
+                        &mut process,
+                        &claude,
+                        &cwd,
+                        &env,
+                        &passthrough_args,
+                        &current_session_id,
+                        &invocation,
+                    )
+                    .await?;
                 } else {
                     return Err(error);
                 }
@@ -254,7 +278,11 @@ fn interactive_claude_unset_env() -> Vec<String> {
 }
 
 fn is_bad_resume_startup_error(error: &CcttyError) -> bool {
-    matches!(error, CcttyError::Tty(message) if tty_output_has_bad_resume_startup_error(message))
+    matches!(error, CcttyError::Tty(message) if tty_output_has_missing_resume_startup_error(message))
+}
+
+fn is_session_lock_startup_error(error: &CcttyError) -> bool {
+    matches!(error, CcttyError::Tty(message) if tty_output_has_session_lock_startup_error(message))
 }
 
 fn strip_session_resume_args(args: &[String]) -> Vec<String> {
@@ -286,6 +314,64 @@ fn strip_session_resume_args(args: &[String]) -> Vec<String> {
     stripped
 }
 
+fn allow_bridged_ask_user_question_tool(args: &[String]) -> Vec<String> {
+    let rewritten = strip_disallowed_tool(args, "AskUserQuestion");
+    if rewritten != args {
+        logging::event("args_rewrite reason=allow_bridged_ask_user_question");
+    }
+    rewritten
+}
+
+fn strip_disallowed_tool(args: &[String], tool_name: &str) -> Vec<String> {
+    let mut stripped = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_disallowed_tools_flag(arg) {
+            if let Some(value) = args.get(index + 1) {
+                if let Some(filtered) = filter_disallowed_tool_value(value, tool_name) {
+                    stripped.push(arg.clone());
+                    stripped.push(filtered);
+                }
+                index += 2;
+            } else {
+                stripped.push(arg.clone());
+                index += 1;
+            }
+            continue;
+        }
+        if let Some((flag, value)) = arg.split_once('=')
+            && is_disallowed_tools_flag(flag)
+        {
+            if let Some(filtered) = filter_disallowed_tool_value(value, tool_name) {
+                stripped.push(format!("{flag}={filtered}"));
+            }
+            index += 1;
+            continue;
+        }
+        stripped.push(arg.clone());
+        index += 1;
+    }
+    stripped
+}
+
+fn is_disallowed_tools_flag(flag: &str) -> bool {
+    matches!(flag, "--disallowedTools" | "--disallowed-tools")
+}
+
+fn filter_disallowed_tool_value(value: &str, tool_name: &str) -> Option<String> {
+    let kept = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.eq_ignore_ascii_case(tool_name))
+        .collect::<Vec<_>>();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(","))
+    }
+}
+
 fn sanitized_arg_shape(args: &[String]) -> String {
     if args.is_empty() {
         return "-".to_owned();
@@ -302,6 +388,63 @@ fn sanitized_arg_shape(args: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn mcp_tool_names_for_log(response: &Value) -> Option<String> {
+    let tools = response
+        .get("result")
+        .and_then(|result| result.get("tools"))
+        .and_then(Value::as_array)?;
+    let mut names = tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(single_line_log_text)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Some("count=0 names=-".to_owned());
+    }
+    let total = names.len();
+    names.truncate(30);
+    let suffix = if total > names.len() { ",..." } else { "" };
+    Some(format!("count={total} names={}{}", names.join(","), suffix))
+}
+
+fn rewrite_mcp_tools_for_claude(mut response: Value) -> Value {
+    let Some(tools) = response
+        .get_mut("result")
+        .and_then(|result| result.get_mut("tools"))
+        .and_then(Value::as_array_mut)
+    else {
+        return response;
+    };
+    for tool in tools {
+        let Some(object) = tool.as_object_mut() else {
+            continue;
+        };
+        if object.get("name").and_then(Value::as_str) == Some("AskUserQuestion") {
+            object.insert(
+                "name".to_owned(),
+                Value::String("ask_user_question".to_owned()),
+            );
+        }
+    }
+    response
+}
+
+fn rewrite_mcp_tool_call_for_sdk(mut message: Value) -> Value {
+    if message.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return message;
+    }
+    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
+        return message;
+    };
+    if params.get("name").and_then(Value::as_str) == Some("ask_user_question") {
+        params.insert(
+            "name".to_owned(),
+            Value::String("AskUserQuestion".to_owned()),
+        );
+    }
+    message
 }
 
 struct StreamSpawnContext<'a> {
@@ -530,7 +673,16 @@ async fn ensure_sdk_mcp_runtime(
         &spawn.session_id,
         spawn.invocation,
     )?;
-    prepare_tty_for_prompt_with_mcp(process, input, &runtime, sdk_state).await?;
+    prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+        process,
+        input,
+        &runtime,
+        sdk_state,
+        spawn,
+        &rewritten_args,
+        &spawn.session_id,
+    )
+    .await?;
     sdk_state.mcp_runtime = Some(runtime);
     Ok(true)
 }
@@ -744,7 +896,17 @@ async fn prepare_stream_tty_for_prompt(
     tail: &mut TailCursor,
     spawn: &StreamSpawnContext<'_>,
 ) -> Result<()> {
-    match prepare_tty_for_prompt(process).await {
+    match prepare_tty_for_prompt_retrying_session_lock(
+        process,
+        spawn.claude,
+        spawn.cwd,
+        spawn.env,
+        &spawn.args,
+        &spawn.session_id,
+        spawn.invocation,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) if is_bad_resume_startup_error(&error) => {
             let stripped_args = strip_session_resume_args(&spawn.args);
@@ -761,7 +923,16 @@ async fn prepare_stream_tty_for_prompt(
                 &None,
                 spawn.invocation,
             )?;
-            prepare_tty_for_prompt(process).await?;
+            prepare_tty_for_prompt_retrying_session_lock(
+                process,
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &stripped_args,
+                &None,
+                spawn.invocation,
+            )
+            .await?;
             tail.reset_for_new_session();
             Ok(())
         }
@@ -777,7 +948,18 @@ async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
     sdk_state: &mut SdkStreamState,
     spawn: &StreamSpawnContext<'_>,
 ) -> Result<()> {
-    match prepare_tty_for_prompt_with_mcp(process, input, runtime, sdk_state).await {
+    let rewritten_spawn_args = args_with_mcp_runtime(&spawn.args, runtime)?;
+    match prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+        process,
+        input,
+        runtime,
+        sdk_state,
+        spawn,
+        &rewritten_spawn_args,
+        &spawn.session_id,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error) if is_bad_resume_startup_error(&error) => {
             let stripped_args = strip_session_resume_args(&spawn.args);
@@ -795,11 +977,81 @@ async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
                 &None,
                 spawn.invocation,
             )?;
-            prepare_tty_for_prompt_with_mcp(process, input, runtime, sdk_state).await?;
+            prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+                process,
+                input,
+                runtime,
+                sdk_state,
+                spawn,
+                &rewritten_args,
+                &None,
+            )
+            .await?;
             tail.reset_for_new_session();
             Ok(())
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn prepare_tty_for_prompt_retrying_session_lock(
+    process: &mut PtyProcess,
+    claude: &str,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    args: &[String],
+    session_id: &Option<String>,
+    invocation: &Invocation,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match prepare_tty_for_prompt(process).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_session_lock_startup_error(&error)
+                    && started.elapsed() < TTY_SESSION_LOCK_RETRY_TIMEOUT =>
+            {
+                logging::event("tty_restart reason=session_lock_retry");
+                process.terminate(PTY_TERMINATE_TIMEOUT);
+                tokio::time::sleep(TTY_SESSION_LOCK_RETRY_DELAY).await;
+                *process = spawn_tty_process(claude, cwd, env, args, session_id, invocation)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+    process: &mut PtyProcess,
+    input: &mut mpsc::Receiver<Value>,
+    runtime: &SdkMcpRuntime,
+    sdk_state: &mut SdkStreamState,
+    spawn: &StreamSpawnContext<'_>,
+    args: &[String],
+    session_id: &Option<String>,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match prepare_tty_for_prompt_with_mcp(process, input, runtime, sdk_state).await {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_session_lock_startup_error(&error)
+                    && started.elapsed() < TTY_SESSION_LOCK_RETRY_TIMEOUT =>
+            {
+                logging::event("tty_restart reason=session_lock_retry");
+                process.terminate(PTY_TERMINATE_TIMEOUT);
+                tokio::time::sleep(TTY_SESSION_LOCK_RETRY_DELAY).await;
+                *process = spawn_tty_process(
+                    spawn.claude,
+                    spawn.cwd,
+                    spawn.env,
+                    args,
+                    session_id,
+                    spawn.invocation,
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -892,6 +1144,7 @@ async fn service_pending_mcp_proxy_requests_for_runtime(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
+        let sdk_message = rewrite_mcp_tool_call_for_sdk(message);
         let request_id = sdk_state.next_mcp_request_id();
         logging::event(format!(
             "mcp_proxy_request server={} method={}",
@@ -903,12 +1156,22 @@ async fn service_pending_mcp_proxy_requests_for_runtime(
             "request": {
                 "subtype": "mcp_message",
                 "server_name": server_name,
-                "message": message,
+                "message": sdk_message,
             },
         });
         println!("{}", serde_json::to_string(&control)?);
         std::io::stdout().flush()?;
-        let mcp_response = wait_for_mcp_control_response(input, sdk_state, &request_id).await?;
+        let mcp_response = rewrite_mcp_tools_for_claude(
+            wait_for_mcp_control_response(input, sdk_state, &request_id).await?,
+        );
+        if method == "tools/list"
+            && let Some(summary) = mcp_tool_names_for_log(&mcp_response)
+        {
+            logging::event(format!(
+                "mcp_proxy_tools server={} tools={summary}",
+                server_name
+            ));
+        }
         writeln!(
             stream,
             "{}",
@@ -2390,7 +2653,7 @@ async fn apply_permission_decision(
             process.write_all(b"\x1b")?;
         }
     } else if saw_prompt {
-        process.write_all(b"\r")?;
+        process.write_all(b"1\r")?;
     }
     Ok(denied)
 }
@@ -2698,6 +2961,11 @@ async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
+    logging::event(format!(
+        "permission_prompt_miss tool={} recent={}",
+        single_line_log_text(&tool_use.name),
+        single_line_log_text(&recent_tty_log_text(&process.recent_output(), 800))
+    ));
     false
 }
 
@@ -2808,7 +3076,34 @@ fn plain_tty_output_has_permission_prompt_for_tool(output: &str, tool_name: &str
         || compact.contains("Esctocancel")
         || compact.contains("Doyouwant")
         || compact.contains("Permissionrequired");
-    has_tool && has_allow_choice && has_deny_choice && has_controls
+    let has_generic_permission_prompt =
+        tool_name != "Bash" && plain_tty_output_has_generic_permission_prompt(output);
+    (has_tool || has_generic_permission_prompt)
+        && has_allow_choice
+        && has_deny_choice
+        && has_controls
+}
+
+fn plain_tty_output_has_generic_permission_prompt(output: &str) -> bool {
+    let compact = compact_tty_output(output);
+    let has_allow_choice =
+        output.contains("Yes") || output.contains("Allow") || compact.contains("Yes");
+    let has_deny_choice =
+        output.contains("No") || output.contains("Deny") || compact.contains("No");
+    let has_controls = output.contains("Enter to confirm")
+        || output.contains("Esc to cancel")
+        || output.contains("Do you want")
+        || output.contains("Permission required")
+        || compact.contains("Entertoconfirm")
+        || compact.contains("Esctocancel")
+        || compact.contains("Doyouwant")
+        || compact.contains("Permissionrequired");
+    let has_permission_language = output.contains("permission")
+        || output.contains("Permission")
+        || output.contains("Do you want")
+        || compact.contains("permission")
+        || compact.contains("Permission");
+    has_allow_choice && has_deny_choice && has_controls && has_permission_language
 }
 
 fn tty_output_has_permission_feedback_prompt(output: &str) -> bool {
@@ -3119,10 +3414,20 @@ fn tty_output_has_auto_mode_consent_prompt(output: &str) -> bool {
 }
 
 fn tty_output_has_bad_resume_startup_error(output: &str) -> bool {
+    tty_output_has_session_lock_startup_error(output)
+        || tty_output_has_missing_resume_startup_error(output)
+}
+
+fn tty_output_has_session_lock_startup_error(output: &str) -> bool {
     let output = plain_tty_output(output);
     let lower = output.to_ascii_lowercase();
-    (lower.contains("session id") && lower.contains("already in use"))
-        || lower.contains("no conversation found with session id")
+    lower.contains("session id") && lower.contains("already in use")
+}
+
+fn tty_output_has_missing_resume_startup_error(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let lower = output.to_ascii_lowercase();
+    lower.contains("no conversation found with session id")
 }
 
 fn tty_output_accepts_prompt(output: &str) -> bool {
@@ -3149,6 +3454,7 @@ fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
     if tty_question_from_form(&plain).is_some()
         || plain_tty_output_has_permission_prompt_for_tool(&plain, "Bash")
         || plain_tty_output_has_file_permission_prompt(&plain)
+        || plain_tty_output_has_generic_permission_prompt(&plain)
     {
         return false;
     }
@@ -3643,6 +3949,20 @@ mod tests {
     }
 
     #[test]
+    fn does_not_retry_submit_on_generic_permission_prompt() {
+        let output = "\
+            Permission required to load a deferred tool\r\n\
+            Do you want to proceed?\r\n\
+            ❯ 1. Yes\r\n\
+              2. No\r\n\
+            Enter to confirm · Esc to cancel";
+        assert!(!tty_output_still_editing_prompt(
+            output,
+            "Write a compact document for SDK users"
+        ));
+    }
+
+    #[test]
     fn strips_session_resume_args_for_startup_retry() {
         let args = vec![
             "--model".to_owned(),
@@ -3663,6 +3983,59 @@ mod tests {
                 "default".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn strips_ask_user_question_from_disallowed_tools_for_bridge() {
+        let args = vec![
+            "--disallowedTools".to_owned(),
+            "AskUserQuestion,Write".to_owned(),
+            "--disallowed-tools=Bash,askuserquestion".to_owned(),
+            "--model".to_owned(),
+            "haiku".to_owned(),
+        ];
+        assert_eq!(
+            strip_disallowed_tool(&args, "AskUserQuestion"),
+            vec![
+                "--disallowedTools".to_owned(),
+                "Write".to_owned(),
+                "--disallowed-tools=Bash".to_owned(),
+                "--model".to_owned(),
+                "haiku".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rewrites_sdk_ask_user_question_mcp_tool_name_for_claude() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    { "name": "AskUserQuestion" },
+                    { "name": "GetWorkspaceDiff" }
+                ]
+            }
+        });
+        let rewritten = rewrite_mcp_tools_for_claude(response);
+        assert_eq!(rewritten["result"]["tools"][0]["name"], "ask_user_question");
+        assert_eq!(rewritten["result"]["tools"][1]["name"], "GetWorkspaceDiff");
+    }
+
+    #[test]
+    fn rewrites_claude_ask_user_question_mcp_tool_call_for_sdk() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "ask_user_question",
+                "arguments": {}
+            }
+        });
+        let rewritten = rewrite_mcp_tool_call_for_sdk(message);
+        assert_eq!(rewritten["params"]["name"], "AskUserQuestion");
     }
 
     #[test]
