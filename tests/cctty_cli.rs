@@ -92,6 +92,57 @@ fn stream_json_text_prompt_uses_tty_transcript() {
 }
 
 #[test]
+fn stream_json_accepts_non_uuid_host_session_id() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let external_session_id = "conductor-session-1";
+
+    let output = Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "text",
+            "--session-id",
+            external_session_id,
+            "Say OK",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    let claude_session_id = argv
+        .windows(2)
+        .find(|pair| pair[0] == "--session-id")
+        .map(|pair| pair[1].clone())
+        .expect("fake Claude should receive --session-id");
+    assert_ne!(claude_session_id, external_session_id);
+    uuid::Uuid::parse_str(&claude_session_id).unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0]["session_id"], external_session_id);
+    assert_eq!(lines[3]["session_id"], external_session_id);
+}
+
+#[test]
 fn interactive_claude_gets_terminal_env_not_sdk_transport_env() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -2021,6 +2072,107 @@ fn stream_json_permission_prompt_stdio_prefers_transcript_tool_use_over_tty_desc
     assert!(
         saw_allowed_result,
         "expected allowed fake tool-with-description result"
+    );
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+}
+
+#[test]
+fn stream_json_permission_prompt_stdio_handles_exit_plan_mode_menu() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000020";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--permission-mode",
+            "plan",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"USE_FAKE_PLAN_MODE"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut permission_request_count = 0;
+    let mut saw_plan_result = false;
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        let value: Value = serde_json::from_str(line.trim()).unwrap();
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                permission_request_count += 1;
+                assert_eq!(
+                    value["request"]["subtype"],
+                    Value::String("can_use_tool".to_owned())
+                );
+                assert_eq!(
+                    value["request"]["tool_name"],
+                    Value::String("ExitPlanMode".to_owned())
+                );
+                let request_id = value["request_id"].as_str().unwrap();
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": {
+                                "behavior": "allow",
+                                "updated_input": { "_targetMode": "default" }
+                            }
+                        }
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                saw_plan_result = value["result"] == "FAKE_PLAN_MANUAL_ALLOWED";
+                break;
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    drop(stdin);
+
+    assert_eq!(
+        permission_request_count, 1,
+        "expected only ExitPlanMode can_use_tool request; internal plan Write should be skipped"
+    );
+    assert!(
+        saw_plan_result,
+        "expected cctty to select manual plan approval"
     );
     let status = child
         .wait_timeout(Duration::from_secs(5))

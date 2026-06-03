@@ -1,8 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader as StdBufReader, IsTerminal, Read, Write};
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -17,6 +14,25 @@ use crate::error::{CcttyError, Result};
 use crate::logging;
 use crate::pty::{PtyProcess, PtySpawnSpec};
 use crate::transcript::{TranscriptState, claude_config_dir, read_complete_lines, transcript_path};
+
+mod claude_path;
+mod sdk_control;
+mod sdk_mcp;
+mod session_id;
+mod tty_text;
+use claude_path::resolve_claude_path;
+use sdk_control::handle_control_request;
+pub(crate) use sdk_mcp::run_mcp_proxy;
+use sdk_mcp::{
+    SdkMcpRuntime, SdkStreamState, args_with_mcp_runtime, create_sdk_mcp_runtime,
+    mcp_tool_names_for_log, rewrite_mcp_tool_call_for_sdk, rewrite_mcp_tools_for_claude,
+    sdk_mcp_runtime_servers, sdk_mcp_runtime_socket_path, sdk_mcp_servers_from_initialize,
+};
+use session_id::SessionIdAlias;
+use tty_text::{
+    compact_tty_output, plain_tty_output, recent_tty_log_text, single_line_log_text,
+    visible_tty_lines, visible_tty_lines_preserving_spacing,
+};
 
 const COMPLETION_IDLE: Duration = Duration::from_millis(1_500);
 const TRANSCRIPT_POLL: Duration = Duration::from_millis(80);
@@ -37,56 +53,6 @@ pub async fn run(invocation: Invocation) -> Result<i32> {
         CommandMode::Passthrough => run_passthrough(&invocation).await,
         CommandMode::Print => run_print(invocation).await,
     }
-}
-
-pub(crate) fn run_mcp_proxy(argv: Vec<String>) -> Result<i32> {
-    let socket_path = argv
-        .get(2)
-        .ok_or_else(|| CcttyError::Usage("__cctty-mcp-proxy missing socket path".to_owned()))?;
-    let server_name = argv
-        .get(3)
-        .ok_or_else(|| CcttyError::Usage("__cctty-mcp-proxy missing server name".to_owned()))?;
-    run_mcp_proxy_stdio(Path::new(socket_path), server_name)
-}
-
-#[cfg(unix)]
-fn run_mcp_proxy_stdio(socket_path: &Path, server_name: &str) -> Result<i32> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let reader = StdBufReader::new(stdin.lock());
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let message = serde_json::from_str::<Value>(trimmed)?;
-        let mut stream = UnixStream::connect(socket_path)?;
-        writeln!(
-            stream,
-            "{}",
-            serde_json::to_string(&json!({
-                "server_name": server_name,
-                "message": message,
-            }))?
-        )?;
-        stream.flush()?;
-
-        let mut response_line = String::new();
-        StdBufReader::new(stream).read_line(&mut response_line)?;
-        let response = serde_json::from_str::<Value>(response_line.trim())?;
-        let mcp_response = response.get("mcp_response").cloned().unwrap_or(Value::Null);
-        writeln!(stdout, "{}", serde_json::to_string(&mcp_response)?)?;
-        stdout.flush()?;
-    }
-    Ok(0)
-}
-
-#[cfg(not(unix))]
-fn run_mcp_proxy_stdio(_socket_path: &Path, _server_name: &str) -> Result<i32> {
-    Err(CcttyError::Usage(
-        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
-    ))
 }
 
 async fn run_passthrough(invocation: &Invocation) -> Result<i32> {
@@ -117,19 +83,21 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         .session_id
         .clone()
         .or_else(|| invocation.resume.clone());
+    let session_alias = SessionIdAlias::new(session_id.clone());
+    let claude_session_id = session_alias.claude_session_id();
     let transcript = if invocation.continue_conversation {
         None
     } else {
-        session_id
+        claude_session_id
             .as_ref()
             .map(|session_id| transcript_path(&config_dir, &cwd, session_id))
     };
     let env = interactive_claude_env();
-    let mut passthrough_args = invocation.passthrough_args.clone();
+    let mut passthrough_args = session_alias.rewrite_args_for_claude(&invocation.passthrough_args);
     if invocation.permission_prompt_tool_stdio {
         passthrough_args = allow_bridged_ask_user_question_tool(&passthrough_args);
     }
-    let mut current_session_id = session_id.clone();
+    let mut current_session_id = claude_session_id.clone();
     let mut attach_existing = invocation.continue_conversation;
     let mut transcript = transcript;
     let mut process = spawn_tty_process(
@@ -188,7 +156,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         }
     }
 
-    let mut tail = TailCursor::new(transcript, &config_dir, attach_existing)?;
+    let mut tail = TailCursor::new(transcript, &config_dir, attach_existing, session_alias)?;
 
     match invocation.input_format {
         InputFormat::Text => {
@@ -390,63 +358,6 @@ fn sanitized_arg_shape(args: &[String]) -> String {
         .join(",")
 }
 
-fn mcp_tool_names_for_log(response: &Value) -> Option<String> {
-    let tools = response
-        .get("result")
-        .and_then(|result| result.get("tools"))
-        .and_then(Value::as_array)?;
-    let mut names = tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .map(single_line_log_text)
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        return Some("count=0 names=-".to_owned());
-    }
-    let total = names.len();
-    names.truncate(30);
-    let suffix = if total > names.len() { ",..." } else { "" };
-    Some(format!("count={total} names={}{}", names.join(","), suffix))
-}
-
-fn rewrite_mcp_tools_for_claude(mut response: Value) -> Value {
-    let Some(tools) = response
-        .get_mut("result")
-        .and_then(|result| result.get_mut("tools"))
-        .and_then(Value::as_array_mut)
-    else {
-        return response;
-    };
-    for tool in tools {
-        let Some(object) = tool.as_object_mut() else {
-            continue;
-        };
-        if object.get("name").and_then(Value::as_str) == Some("AskUserQuestion") {
-            object.insert(
-                "name".to_owned(),
-                Value::String("ask_user_question".to_owned()),
-            );
-        }
-    }
-    response
-}
-
-fn rewrite_mcp_tool_call_for_sdk(mut message: Value) -> Value {
-    if message.get("method").and_then(Value::as_str) != Some("tools/call") {
-        return message;
-    }
-    let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
-        return message;
-    };
-    if params.get("name").and_then(Value::as_str) == Some("ask_user_question") {
-        params.insert(
-            "name".to_owned(),
-            Value::String("AskUserQuestion".to_owned()),
-        );
-    }
-    message
-}
-
 struct StreamSpawnContext<'a> {
     claude: &'a str,
     cwd: &'a Path,
@@ -454,188 +365,6 @@ struct StreamSpawnContext<'a> {
     args: Vec<String>,
     session_id: Option<String>,
     invocation: &'a Invocation,
-}
-
-struct SdkStreamState {
-    mcp_servers: Vec<McpServerStatus>,
-    mcp_runtime: Option<SdkMcpRuntime>,
-    deferred_input: VecDeque<Value>,
-    next_mcp_request_id: u64,
-}
-
-impl SdkStreamState {
-    fn new(args: &[String]) -> Self {
-        let mut state = Self {
-            mcp_servers: mcp_servers_from_args(args),
-            mcp_runtime: None,
-            deferred_input: VecDeque::new(),
-            next_mcp_request_id: 0,
-        };
-        state.add_sdk_mcp_servers(sdk_mcp_servers_from_args(args));
-        state
-    }
-
-    fn add_sdk_mcp_servers(&mut self, names: Vec<String>) {
-        for name in names {
-            if self.mcp_servers.iter().any(|server| server.name == name) {
-                continue;
-            }
-            self.mcp_servers.push(McpServerStatus {
-                name,
-                kind: "sdk".to_owned(),
-            });
-        }
-    }
-
-    fn sdk_mcp_server_names(&self) -> Vec<String> {
-        self.mcp_servers
-            .iter()
-            .filter(|server| server.kind == "sdk")
-            .map(|server| server.name.clone())
-            .collect()
-    }
-
-    fn next_mcp_request_id(&mut self) -> String {
-        self.next_mcp_request_id += 1;
-        format!("cctty-mcp-{}", self.next_mcp_request_id)
-    }
-
-    fn mcp_status(&self) -> Value {
-        let sdk_runtime_started = self.mcp_runtime.is_some();
-        let servers = self
-            .mcp_servers
-            .iter()
-            .map(|server| {
-                let is_sdk = server.kind == "sdk";
-                json!({
-                    "name": server.name,
-                    "status": if is_sdk && !sdk_runtime_started { "pending" } else { "connected" },
-                    "serverInfo": {
-                        "name": server.name,
-                        "version": if is_sdk { "cctty-sdk-proxy" } else { "unknown" },
-                    },
-                    "config": if is_sdk {
-                        json!({ "type": "sdk", "name": server.name })
-                    } else {
-                        json!({ "type": server.kind, "source": "mcp-config" })
-                    },
-                    "scope": "session",
-                    "tools": [],
-                })
-            })
-            .collect::<Vec<_>>();
-        json!({ "mcpServers": servers })
-    }
-}
-
-struct McpServerStatus {
-    name: String,
-    kind: String,
-}
-
-#[cfg(unix)]
-struct SdkMcpRuntime {
-    socket_path: PathBuf,
-    listener: UnixListener,
-    servers: Vec<String>,
-}
-
-#[cfg(unix)]
-impl Drop for SdkMcpRuntime {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
-    }
-}
-
-#[cfg(not(unix))]
-struct SdkMcpRuntime {
-    servers: Vec<String>,
-}
-
-fn mcp_config_values_from_args(args: &[String]) -> Vec<String> {
-    let mut configs = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--mcp-config" {
-            if let Some(value) = args.get(index + 1) {
-                configs.push(value.clone());
-            }
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--mcp-config=") {
-            configs.push(value.to_owned());
-        }
-        index += 1;
-    }
-    configs
-}
-
-fn mcp_servers_from_args(args: &[String]) -> Vec<McpServerStatus> {
-    let mut servers = Vec::new();
-    for config in mcp_config_values_from_args(args) {
-        if let Ok(value) = serde_json::from_str::<Value>(&config) {
-            if let Some(mcp_servers) = value.get("mcpServers").and_then(Value::as_object) {
-                for (name, server) in mcp_servers {
-                    let kind = server
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned();
-                    if servers
-                        .iter()
-                        .any(|existing: &McpServerStatus| existing.name == name.as_str())
-                    {
-                        continue;
-                    }
-                    servers.push(McpServerStatus {
-                        name: name.clone(),
-                        kind,
-                    });
-                }
-            }
-        }
-    }
-    servers
-}
-
-fn sdk_mcp_servers_from_args(args: &[String]) -> Vec<String> {
-    let mut servers = Vec::new();
-    for config in mcp_config_values_from_args(args) {
-        if let Ok(value) = serde_json::from_str::<Value>(&config) {
-            if let Some(mcp_servers) = value.get("mcpServers").and_then(Value::as_object) {
-                for (name, server) in mcp_servers {
-                    if server.get("type").and_then(Value::as_str) == Some("sdk") {
-                        let server_name = server
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or(name)
-                            .to_owned();
-                        if !servers.contains(&server_name) {
-                            servers.push(server_name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    servers
-}
-
-fn sdk_mcp_servers_from_initialize(value: &Value) -> Vec<String> {
-    value
-        .get("request")
-        .and_then(|request| request.get("sdkMcpServers"))
-        .and_then(Value::as_array)
-        .map(|servers| {
-            servers
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 async fn ensure_sdk_mcp_runtime(
@@ -685,119 +414,6 @@ async fn ensure_sdk_mcp_runtime(
     .await?;
     sdk_state.mcp_runtime = Some(runtime);
     Ok(true)
-}
-
-#[cfg(unix)]
-fn create_sdk_mcp_runtime(servers: Vec<String>) -> Result<SdkMcpRuntime> {
-    let socket_path = std::env::temp_dir().join(format!("ct-{}.sock", Uuid::new_v4()));
-    let listener = UnixListener::bind(&socket_path)?;
-    listener.set_nonblocking(true)?;
-    Ok(SdkMcpRuntime {
-        socket_path,
-        listener,
-        servers,
-    })
-}
-
-#[cfg(not(unix))]
-fn create_sdk_mcp_runtime(servers: Vec<String>) -> Result<SdkMcpRuntime> {
-    let _ = servers;
-    Err(CcttyError::Usage(
-        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
-    ))
-}
-
-#[cfg(unix)]
-fn sdk_mcp_runtime_socket_path(runtime: &SdkMcpRuntime) -> String {
-    runtime.socket_path.to_string_lossy().into_owned()
-}
-
-#[cfg(not(unix))]
-fn sdk_mcp_runtime_socket_path(_runtime: &SdkMcpRuntime) -> String {
-    "-".to_owned()
-}
-
-fn sdk_mcp_runtime_servers(runtime: &SdkMcpRuntime) -> &[String] {
-    &runtime.servers
-}
-
-fn args_with_mcp_runtime(args: &[String], runtime: &SdkMcpRuntime) -> Result<Vec<String>> {
-    let mut rewritten = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--mcp-config" {
-            if let Some(value) = args.get(index + 1) {
-                if let Some(stripped) = mcp_config_without_sdk_servers(value)? {
-                    rewritten.push(arg.clone());
-                    rewritten.push(stripped);
-                }
-            }
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--mcp-config=") {
-            if let Some(stripped) = mcp_config_without_sdk_servers(value)? {
-                rewritten.push(format!("--mcp-config={stripped}"));
-            }
-            index += 1;
-            continue;
-        }
-        rewritten.push(arg.clone());
-        index += 1;
-    }
-    rewritten.push("--mcp-config".to_owned());
-    rewritten.push(sdk_mcp_proxy_config(runtime)?);
-    Ok(rewritten)
-}
-
-fn mcp_config_without_sdk_servers(raw: &str) -> Result<Option<String>> {
-    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
-        return Ok(Some(raw.to_owned()));
-    };
-    let Some(object) = value.as_object_mut() else {
-        return Ok(Some(raw.to_owned()));
-    };
-    if let Some(mcp_servers) = object.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        mcp_servers.retain(|_, server| server.get("type").and_then(Value::as_str) != Some("sdk"));
-        if mcp_servers.is_empty() {
-            object.remove("mcpServers");
-        }
-    }
-    if object.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(serde_json::to_string(&value)?))
-}
-
-#[cfg(unix)]
-fn sdk_mcp_proxy_config(runtime: &SdkMcpRuntime) -> Result<String> {
-    let executable = std::env::current_exe()?;
-    let mut mcp_servers = serde_json::Map::new();
-    for server in &runtime.servers {
-        mcp_servers.insert(
-            server.clone(),
-            json!({
-                "type": "stdio",
-                "command": executable,
-                "args": [
-                    "__cctty-mcp-proxy",
-                    runtime.socket_path.to_string_lossy(),
-                    server,
-                ],
-            }),
-        );
-    }
-    Ok(serde_json::to_string(
-        &json!({ "mcpServers": mcp_servers }),
-    )?)
-}
-
-#[cfg(not(unix))]
-fn sdk_mcp_proxy_config(_runtime: &SdkMcpRuntime) -> Result<String> {
-    Err(CcttyError::Usage(
-        "SDK MCP proxy is only supported on Unix platforms".to_owned(),
-    ))
 }
 
 async fn run_stream_json(
@@ -1223,228 +839,6 @@ async fn wait_for_mcp_control_response(
     }
 }
 
-async fn handle_control_request(
-    process: &mut PtyProcess,
-    _input: &mut mpsc::Receiver<Value>,
-    sdk_state: &mut SdkStreamState,
-    spawn: &mut StreamSpawnContext<'_>,
-    tty_prepared: &mut bool,
-    value: &Value,
-) -> Result<()> {
-    let request_id = value
-        .get("request_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CcttyError::Usage("control_request missing request_id".to_owned()))?;
-    let subtype = value
-        .get("request")
-        .and_then(|request| request.get("subtype"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let response = match subtype {
-        "initialize" => {
-            sdk_state.add_sdk_mcp_servers(sdk_mcp_servers_from_initialize(value));
-            control_success(request_id, sdk_initialize_response())
-        }
-        "interrupt" => {
-            process.interrupt()?;
-            control_success(request_id, Value::Null)
-        }
-        "set_model" => {
-            if let Some(model) = control_request_string(value, &["model"]) {
-                spawn.args = args_with_option_value(&spawn.args, "--model", &model);
-                restart_tty_after_control_update(process, sdk_state, spawn, tty_prepared)?;
-                logging::event(format!(
-                    "control_update subtype=set_model model={}",
-                    single_line_log_text(&model)
-                ));
-            }
-            control_success(request_id, Value::Null)
-        }
-        "set_permission_mode" => {
-            if let Some(mode) =
-                control_request_string(value, &["mode", "permission_mode", "permissionMode"])
-            {
-                spawn.args = args_with_option_value(&spawn.args, "--permission-mode", &mode);
-                restart_tty_after_control_update(process, sdk_state, spawn, tty_prepared)?;
-                logging::event(format!(
-                    "control_update subtype=set_permission_mode mode={}",
-                    single_line_log_text(&mode)
-                ));
-            }
-            control_success(request_id, Value::Null)
-        }
-        "set_max_thinking_tokens" => control_success(request_id, Value::Null),
-        "apply_flag_settings" => control_success(request_id, Value::Null),
-        "get_context_usage" => {
-            control_success(request_id, json!({ "total": 0, "used": 0, "remaining": 0 }))
-        }
-        "mcp_status" => control_success(request_id, sdk_state.mcp_status()),
-        _ => control_error(
-            request_id,
-            format!("Unsupported control request: {subtype}"),
-        ),
-    };
-    logging::event(format!("control_request subtype={subtype}"));
-    println!("{}", serde_json::to_string(&response)?);
-    std::io::stdout().flush()?;
-    Ok(())
-}
-
-fn control_request_string(value: &Value, keys: &[&str]) -> Option<String> {
-    let request = value.get("request")?;
-    keys.iter().find_map(|key| {
-        request
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    })
-}
-
-fn restart_tty_after_control_update(
-    process: &mut PtyProcess,
-    sdk_state: &SdkStreamState,
-    spawn: &StreamSpawnContext<'_>,
-    tty_prepared: &mut bool,
-) -> Result<()> {
-    let args = args_with_runtime_mcp(&spawn.args, sdk_state.mcp_runtime.as_ref())?;
-    logging::event(format!(
-        "tty_restart reason=control_update args={}",
-        sanitized_arg_shape(&args)
-    ));
-    process.terminate(PTY_TERMINATE_TIMEOUT);
-    *process = spawn_tty_process(
-        spawn.claude,
-        spawn.cwd,
-        spawn.env,
-        &args,
-        &spawn.session_id,
-        spawn.invocation,
-    )?;
-    *tty_prepared = false;
-    Ok(())
-}
-
-fn args_with_runtime_mcp(args: &[String], runtime: Option<&SdkMcpRuntime>) -> Result<Vec<String>> {
-    match runtime {
-        Some(runtime) => args_with_mcp_runtime(args, runtime),
-        None => Ok(args.to_vec()),
-    }
-}
-
-fn args_with_option_value(args: &[String], flag: &str, value: &str) -> Vec<String> {
-    let mut updated = Vec::with_capacity(args.len() + 2);
-    let mut index = 0;
-    let mut replaced = false;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == flag {
-            updated.push(arg.clone());
-            updated.push(value.to_owned());
-            replaced = true;
-            index += 1;
-            if index < args.len() && !args[index].starts_with('-') {
-                index += 1;
-            }
-            continue;
-        }
-        if arg.starts_with(&format!("{flag}=")) {
-            updated.push(format!("{flag}={value}"));
-            replaced = true;
-            index += 1;
-            continue;
-        }
-        updated.push(arg.clone());
-        index += 1;
-    }
-    if !replaced {
-        updated.push(flag.to_owned());
-        updated.push(value.to_owned());
-    }
-    updated
-}
-
-fn sdk_initialize_response() -> Value {
-    json!({
-        "commands": [],
-        "agents": [],
-        "output_style": "default",
-        "available_output_styles": ["default"],
-        "models": [
-            {
-                "value": "default",
-                "displayName": "Default (recommended)",
-                "description": "Claude Code default model through cctty",
-                "supportsEffort": true,
-                "supportedEffortLevels": ["low", "medium", "high", "max"],
-                "supportsAdaptiveThinking": true,
-                "supportsAutoMode": true,
-            },
-            {
-                "value": "sonnet[1m]",
-                "displayName": "Sonnet (1M context)",
-                "description": "Claude Code Sonnet 1M context alias through cctty",
-                "supportsEffort": true,
-                "supportedEffortLevels": ["low", "medium", "high", "max"],
-                "supportsAdaptiveThinking": true,
-                "supportsAutoMode": true,
-            },
-            {
-                "value": "opus",
-                "displayName": "Opus",
-                "description": "Claude Code Opus alias through cctty",
-                "supportsEffort": true,
-                "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
-                "supportsAdaptiveThinking": true,
-                "supportsFastMode": true,
-                "supportsAutoMode": true,
-            },
-            {
-                "value": "haiku",
-                "displayName": "Haiku",
-                "description": "Claude Code Haiku alias through cctty",
-            },
-            {
-                "value": "claude-opus-4-8",
-                "displayName": "Opus 4.8",
-                "description": "Claude Code Opus 4.8 model through cctty",
-                "supportsEffort": true,
-                "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
-                "supportsAdaptiveThinking": true,
-                "supportsFastMode": true,
-                "supportsAutoMode": true,
-            },
-        ],
-        "account": {
-            "tokenSource": "cctty",
-            "apiProvider": "firstParty",
-        },
-        "fast_mode_state": "off",
-        "pid": std::process::id(),
-    })
-}
-
-fn control_success(request_id: &str, response: Value) -> Value {
-    json!({
-        "type": "control_response",
-        "response": {
-            "subtype": "success",
-            "request_id": request_id,
-            "response": response,
-        }
-    })
-}
-
-fn control_error(request_id: &str, error: String) -> Value {
-    json!({
-        "type": "control_response",
-        "response": {
-            "subtype": "error",
-            "request_id": request_id,
-            "error": error,
-        }
-    })
-}
-
 async fn submit_prompt_and_tail(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
@@ -1516,7 +910,8 @@ async fn tail_until_complete(
                 Ok((lines, consumed)) if consumed > 0 => {
                     tail.offset += consumed;
                     for line in lines {
-                        let value: Value = serde_json::from_str(&line)?;
+                        let mut value: Value = serde_json::from_str(&line)?;
+                        tail.externalize_value(&mut value);
                         state.apply(&value);
                         emit_transcript_value(
                             &value,
@@ -1543,7 +938,10 @@ async fn tail_until_complete(
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
-        if questions.maybe_handle_tty_question(process, None).await? {
+        if questions
+            .maybe_handle_tty_question(process, None, None)
+            .await?
+        {
             last_activity = Instant::now();
         }
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
@@ -1591,9 +989,10 @@ async fn tail_until_complete_stream(
                 Ok((lines, consumed)) if consumed > 0 => {
                     tail.offset += consumed;
                     for line in lines {
-                        let value: Value = serde_json::from_str(&line)?;
+                        let mut value: Value = serde_json::from_str(&line)?;
+                        tail.externalize_value(&mut value);
                         permission
-                            .maybe_request_tool_permission(process, input, &value)
+                            .maybe_request_tool_permission(process, input, sdk_state, &value)
                             .await?;
                         state.apply(&value);
                         emit_transcript_value(
@@ -1624,7 +1023,7 @@ async fn tail_until_complete_stream(
         }
         if !permission.handled_ask_user_question()
             && questions
-                .maybe_handle_tty_question(process, Some(input))
+                .maybe_handle_tty_question(process, Some(input), Some(sdk_state))
                 .await?
         {
             permission.mark_ask_user_question_handled();
@@ -1856,6 +1255,7 @@ struct PermissionBridge {
     requested_tool_use_ids: HashSet<String>,
     handled_tool_keys: Vec<ToolKey>,
     pending_tty_permission: Option<PendingTtyPermission>,
+    last_internal_plan_input: Option<Value>,
     denied_current_turn: bool,
     handled_ask_user_question: bool,
     next_request: u64,
@@ -1868,6 +1268,7 @@ impl PermissionBridge {
             requested_tool_use_ids: HashSet::new(),
             handled_tool_keys: Vec::new(),
             pending_tty_permission: None,
+            last_internal_plan_input: None,
             denied_current_turn: false,
             handled_ask_user_question: false,
             next_request: 0,
@@ -1882,10 +1283,19 @@ impl PermissionBridge {
         if !self.enabled {
             return Ok(false);
         }
-        let Some(tool_use) = tool_use_from_tty_permission_prompt(
-            &process.recent_output(),
-            format!("cctty_tty_tool_{}", self.next_request),
-        ) else {
+        let recent_output = process.recent_output();
+        let tool_use_id = format!("cctty_tty_tool_{}", self.next_request);
+        let Some(tool_use) =
+            tool_use_from_tty_permission_prompt(&recent_output, tool_use_id.clone()).or_else(
+                || {
+                    tool_use_from_tty_plan_approval_prompt(
+                        &recent_output,
+                        tool_use_id,
+                        self.last_internal_plan_input.as_ref(),
+                    )
+                },
+            )
+        else {
             self.pending_tty_permission = None;
             return Ok(false);
         };
@@ -1930,6 +1340,7 @@ impl PermissionBridge {
         &mut self,
         process: &mut PtyProcess,
         input: &mut mpsc::Receiver<Value>,
+        sdk_state: &mut SdkStreamState,
         transcript: &Value,
     ) -> Result<bool> {
         if !self.enabled {
@@ -1947,6 +1358,33 @@ impl PermissionBridge {
             if self.has_handled_tool(&tool_use) {
                 continue;
             }
+            if is_internal_claude_plan_write(&tool_use) {
+                self.mark_tool_handled(&tool_use);
+                self.last_internal_plan_input = internal_plan_input_from_write(&tool_use);
+                if self.pending_tty_permission_matches(&tool_use) {
+                    self.pending_tty_permission = None;
+                }
+                logging::event(format!(
+                    "permission_skip_internal_plan_write tool_use_id={} path={}",
+                    tool_use.id,
+                    single_line_log_text(
+                        tool_use
+                            .input
+                            .get("file_path")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    )
+                ));
+                continue;
+            }
+            if is_internal_exit_plan_tool_search(&tool_use) {
+                self.mark_tool_handled(&tool_use);
+                logging::event(format!(
+                    "permission_skip_internal_exit_plan_tool_search tool_use_id={}",
+                    tool_use.id
+                ));
+                continue;
+            }
             requested = true;
             self.mark_tool_handled(&tool_use);
             if tool_use.name == "AskUserQuestion" {
@@ -1955,9 +1393,66 @@ impl PermissionBridge {
             if self.pending_tty_permission_matches(&tool_use) {
                 self.pending_tty_permission = None;
             }
+            if tool_use.name == "AskUserQuestion"
+                && self
+                    .request_ask_user_question_via_sdk_mcp(process, input, sdk_state, &tool_use)
+                    .await?
+            {
+                continue;
+            }
             self.request_permission(process, input, &tool_use).await?;
         }
         Ok(requested)
+    }
+
+    async fn request_ask_user_question_via_sdk_mcp(
+        &mut self,
+        process: &mut PtyProcess,
+        input: &mut mpsc::Receiver<Value>,
+        sdk_state: &mut SdkStreamState,
+        tool_use: &ToolUse,
+    ) -> Result<bool> {
+        let Some(server_name) = sdk_state.sdk_mcp_server_names().into_iter().next() else {
+            return Ok(false);
+        };
+        let request_id = sdk_state.next_mcp_request_id();
+        let message_id = request_id.clone();
+        let control = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "mcp_message",
+                "server_name": server_name,
+                "message": {
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "AskUserQuestion",
+                            "arguments": sdk_ask_user_question_input(&tool_use.input),
+                        },
+                    },
+                },
+        });
+        logging::event(format!(
+            "permission_request_mcp server={} tool={} tool_use_id={}",
+            server_name, tool_use.name, tool_use.id
+        ));
+        println!("{}", serde_json::to_string(&control)?);
+        std::io::stdout().flush()?;
+        let mcp_response = wait_for_mcp_control_response(input, sdk_state, &request_id).await?;
+        let feedback = ask_user_question_feedback_from_mcp_response(&mcp_response, &tool_use.input)
+            .or_else(|| ask_user_question_default_feedback(&tool_use.input))
+            .unwrap_or_else(|| "用户已经回答了表单，请根据已有回答继续。".to_owned());
+        logging::event(format!(
+            "permission_response_mcp server={} tool={} feedback={}",
+            server_name,
+            tool_use.name,
+            single_line_log_text(&feedback)
+        ));
+        let _ = wait_for_tty_question_form(process).await;
+        cancel_tty_question(process, Some(&feedback)).await?;
+        Ok(true)
     }
 
     async fn request_permission(
@@ -2060,6 +1555,7 @@ impl TtyQuestionBridge {
         &mut self,
         process: &mut PtyProcess,
         input: Option<&mut mpsc::Receiver<Value>>,
+        sdk_state: Option<&mut SdkStreamState>,
     ) -> Result<bool> {
         let Some(question) = tty_question_from_form(&process.recent_output()) else {
             self.pending = None;
@@ -2106,7 +1602,8 @@ impl TtyQuestionBridge {
         let Some(input) = input else {
             return Ok(false);
         };
-        self.request_question(process, input, question).await?;
+        self.request_question(process, input, sdk_state, question)
+            .await?;
         Ok(true)
     }
 
@@ -2114,8 +1611,16 @@ impl TtyQuestionBridge {
         &mut self,
         process: &mut PtyProcess,
         input: &mut mpsc::Receiver<Value>,
+        sdk_state: Option<&mut SdkStreamState>,
         question: TtyQuestion,
     ) -> Result<()> {
+        if let Some(sdk_state) = sdk_state
+            && self
+                .request_question_via_sdk_mcp(process, input, sdk_state, &question)
+                .await?
+        {
+            return Ok(());
+        }
         let request_id = format!("cctty_question_{}", self.next_request);
         self.next_request += 1;
         let tool_use = ToolUse {
@@ -2150,6 +1655,61 @@ impl TtyQuestionBridge {
         let response = wait_for_control_response(input, &tool_use.id).await?;
         apply_question_decision(process, &question, &response).await?;
         Ok(())
+    }
+
+    async fn request_question_via_sdk_mcp(
+        &mut self,
+        process: &mut PtyProcess,
+        input: &mut mpsc::Receiver<Value>,
+        sdk_state: &mut SdkStreamState,
+        question: &TtyQuestion,
+    ) -> Result<bool> {
+        let Some(server_name) = sdk_state.sdk_mcp_server_names().into_iter().next() else {
+            return Ok(false);
+        };
+        let request_id = sdk_state.next_mcp_request_id();
+        let message_id = request_id.clone();
+        let tool_input = question.to_tool_input();
+        let control = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "mcp_message",
+                "server_name": server_name,
+                "message": {
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "AskUserQuestion",
+                            "arguments": sdk_ask_user_question_input(&tool_input),
+                        },
+                    },
+                },
+        });
+        logging::event(format!(
+            "question_request_mcp server={} question={} options={}",
+            server_name,
+            single_line_log_text(&question.question),
+            question
+                .options
+                .iter()
+                .filter(|option| !option.special)
+                .count()
+        ));
+        println!("{}", serde_json::to_string(&control)?);
+        std::io::stdout().flush()?;
+        let mcp_response = wait_for_mcp_control_response(input, sdk_state, &request_id).await?;
+        let feedback = question_feedback_from_mcp_response(&mcp_response, question)
+            .unwrap_or_else(|| default_question_answer_feedback(question));
+        logging::event(format!(
+            "question_response_mcp server={} question={} feedback={}",
+            server_name,
+            single_line_log_text(&question.question),
+            single_line_log_text(&feedback)
+        ));
+        cancel_tty_question(process, Some(&feedback)).await?;
+        Ok(true)
     }
 }
 
@@ -2239,6 +1799,9 @@ impl ToolKey {
     }
 
     fn matches(&self, other: &Self) -> bool {
+        if self.name == "ExitPlanMode" && other.name == "ExitPlanMode" {
+            return true;
+        }
         if is_file_tool(&self.name)
             && is_file_tool(&other.name)
             && let (Some(left), Some(right)) = (&self.file_path, &other.file_path)
@@ -2265,12 +1828,11 @@ fn tty_question_from_form(output: &str) -> Option<TtyQuestion> {
     {
         return None;
     }
-    let form = plain
-        .rsplit_once("✔ Submit →")
-        .map(|(_, after)| after)
-        .unwrap_or(&plain);
+    let form = tty_question_form_region(&plain)?;
     let option_start = form.find("❯ 1. ").or_else(|| form.find("1. "))?;
-    let question = form[..option_start].trim();
+    let prompt = form[..option_start].trim();
+    let header_hint = tty_question_header(&plain);
+    let (header, question) = split_tty_question_prompt(prompt, header_hint.as_deref());
     if question.is_empty() {
         return None;
     }
@@ -2279,10 +1841,25 @@ fn tty_question_from_form(output: &str) -> Option<TtyQuestion> {
         return None;
     }
     Some(TtyQuestion {
-        question: question.to_owned(),
-        header: tty_question_header(&plain).unwrap_or_else(|| short_header(question)),
+        question,
+        header,
         options,
     })
+}
+
+fn tty_question_form_region(plain: &str) -> Option<&str> {
+    let after_submit = plain
+        .rsplit_once("✔ Submit →")
+        .map(|(_, after)| after.trim())
+        .filter(|after| after.contains("1. "));
+    if after_submit.is_some() {
+        return after_submit;
+    }
+    plain
+        .rsplit_once('☐')
+        .map(|(_, after)| after.trim())
+        .filter(|after| after.contains("1. "))
+        .or(Some(plain))
 }
 
 fn tty_question_header(plain: &str) -> Option<String> {
@@ -2292,6 +1869,49 @@ fn tty_question_header(plain: &str) -> Option<String> {
         .map(|(_, header)| header.trim())
         .filter(|header| !header.is_empty())
         .map(short_header)
+}
+
+fn split_tty_question_prompt(prompt: &str, header_hint: Option<&str>) -> (String, String) {
+    let prompt = prompt.trim();
+    if let Some(header) = header_hint
+        && let Some(question) = prompt.strip_prefix(header)
+    {
+        let question = question.trim();
+        if !question.is_empty() {
+            return (short_header(header), question.to_owned());
+        }
+    }
+    if let Some((header, question)) = prompt.split_once(' ') {
+        let question = question.trim();
+        if looks_like_question_text(question) && !looks_like_question_leader(header) {
+            return (short_header(header), question.to_owned());
+        }
+    }
+    if let Some(header) = header_hint {
+        return (short_header(header), prompt.to_owned());
+    }
+    (short_header(prompt), prompt.to_owned())
+}
+
+fn looks_like_question_leader(text: &str) -> bool {
+    matches!(
+        text.trim_matches(|ch: char| !ch.is_alphanumeric())
+            .to_ascii_lowercase()
+            .as_str(),
+        "what" | "which" | "how" | "who" | "when" | "where" | "why"
+    )
+}
+
+fn looks_like_question_text(text: &str) -> bool {
+    text.ends_with('?')
+        || text.ends_with('？')
+        || text.ends_with(':')
+        || text.ends_with('：')
+        || text.starts_with("Which ")
+        || text.starts_with("What ")
+        || text.starts_with("How ")
+        || text.starts_with("请选择")
+        || text.starts_with("请")
 }
 
 fn short_header(text: &str) -> String {
@@ -2352,6 +1972,9 @@ fn trim_tty_option_text(raw: &str) -> String {
 
 fn split_question_option(value: &str) -> (String, String) {
     let words = value.split_whitespace().collect::<Vec<_>>();
+    if words.len() == 2 && words[1].starts_with(words[0]) {
+        return (words[0].to_owned(), words[1].to_owned());
+    }
     if words.len() <= 3 {
         return (value.to_owned(), String::new());
     }
@@ -2445,6 +2068,52 @@ fn tool_uses_from_assistant(value: &Value) -> Vec<ToolUse> {
         .unwrap_or_default()
 }
 
+fn is_internal_claude_plan_write(tool_use: &ToolUse) -> bool {
+    if tool_use.name != "Write" {
+        return false;
+    }
+    let Some(file_path) = tool_use.input.get("file_path").and_then(Value::as_str) else {
+        return false;
+    };
+    let normalized = file_path.replace('\\', "/");
+    normalized.ends_with(".md")
+        && (normalized.contains("/.claude/plans/")
+            || normalized.starts_with(".claude/plans/")
+            || normalized.starts_with("~/.claude/plans/"))
+}
+
+fn internal_plan_input_from_write(tool_use: &ToolUse) -> Option<Value> {
+    if !is_internal_claude_plan_write(tool_use) {
+        return None;
+    }
+    let mut input = serde_json::Map::new();
+    if let Some(content) = tool_use.input.get("content").and_then(Value::as_str)
+        && !content.trim().is_empty()
+    {
+        input.insert("plan".to_owned(), Value::String(content.to_owned()));
+    }
+    if let Some(file_path) = tool_use.input.get("file_path").and_then(Value::as_str)
+        && !file_path.trim().is_empty()
+    {
+        input.insert(
+            "planFilePath".to_owned(),
+            Value::String(file_path.to_owned()),
+        );
+    }
+    (!input.is_empty()).then_some(Value::Object(input))
+}
+
+fn is_internal_exit_plan_tool_search(tool_use: &ToolUse) -> bool {
+    if tool_use.name != "ToolSearch" {
+        return false;
+    }
+    tool_use
+        .input
+        .get("query")
+        .and_then(Value::as_str)
+        .is_some_and(|query| query.trim().eq_ignore_ascii_case("select:ExitPlanMode"))
+}
+
 fn tool_use_from_tty_permission_prompt(output: &str, tool_use_id: String) -> Option<ToolUse> {
     let plain_output = plain_tty_output(output);
     if plain_tty_output_has_permission_prompt(&plain_output) {
@@ -2458,6 +2127,52 @@ fn tool_use_from_tty_permission_prompt(output: &str, tool_use_id: String) -> Opt
     file_tool_use_from_tty_permission_prompt(&plain_output, tool_use_id)
 }
 
+fn tool_use_from_tty_plan_approval_prompt(
+    output: &str,
+    tool_use_id: String,
+    plan_input: Option<&Value>,
+) -> Option<ToolUse> {
+    tty_output_has_plan_approval_prompt(output).then(|| ToolUse {
+        id: tool_use_id,
+        name: "ExitPlanMode".to_owned(),
+        input: plan_input.cloned().unwrap_or_else(|| {
+            json!({
+                "plan": tty_plan_text_from_approval_prompt(output)
+                    .unwrap_or_else(|| "Plan is ready for approval.".to_owned()),
+            })
+        }),
+    })
+}
+
+fn tty_plan_text_from_approval_prompt(output: &str) -> Option<String> {
+    let output = plain_tty_output(output);
+    let before_prompt = if let Some((before, _)) = output.split_once("Claude has written up a plan")
+    {
+        before
+    } else if let Some((before, _)) = output.split_once("Claude wrote up a plan") {
+        before
+    } else {
+        return None;
+    };
+    let plan = before_prompt
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '─' | '━' | '╌' | '╭' | '╮' | '╰' | '╯' | '│')
+        })
+        .trim();
+    if plan.is_empty() {
+        return None;
+    }
+    let char_count = plan.chars().count();
+    let plan = if char_count > 2_000 {
+        plan.chars()
+            .skip(char_count.saturating_sub(2_000))
+            .collect::<String>()
+    } else {
+        plan.to_owned()
+    };
+    Some(plan)
+}
+
 fn bash_command_from_tty_permission_prompt(output: &str) -> Option<String> {
     if let Some(command) = bash_structured_command_from_tty_output(output) {
         return Some(command);
@@ -2465,7 +2180,8 @@ fn bash_command_from_tty_permission_prompt(output: &str) -> Option<String> {
     if let Some(command) = bash_parenthetical_command_from_tty_output(output) {
         return Some(command);
     }
-    let rest = output.split("Bash command ").nth(1)?;
+    let plain_output = plain_tty_output(output);
+    let rest = plain_output.split("Bash command ").nth(1)?;
     let mut command = rest;
     for marker in [
         " Permission rule ",
@@ -2477,30 +2193,83 @@ fn bash_command_from_tty_permission_prompt(output: &str) -> Option<String> {
             command = before;
         }
     }
-    let command = normalize_tool_command(command);
-    (!command.is_empty()).then_some(command)
+    let command = normalize_tty_bash_command(command);
+    valid_tty_bash_command_candidate(&command).then_some(command)
 }
 
 fn bash_structured_command_from_tty_output(output: &str) -> Option<String> {
     let lines = visible_tty_lines(output);
+    let spaced_lines = visible_tty_lines_preserving_spacing(output);
     for (index, line) in lines.iter().enumerate().rev() {
         if line != "Bash command" {
             continue;
         }
         let command = lines
             .iter()
+            .zip(spaced_lines.iter())
             .skip(index + 1)
-            .find(|candidate| {
-                !candidate.starts_with("Permission rule")
-                    && !candidate.starts_with("/permissions")
-                    && !candidate.starts_with("Do you want")
-            })?
-            .clone();
-        if !command.is_empty() {
+            .find_map(|(candidate, spaced_candidate)| {
+                if candidate.starts_with("Permission rule")
+                    || candidate.starts_with("/permissions")
+                    || candidate.starts_with("Do you want")
+                {
+                    return None;
+                }
+                bash_command_from_visible_tty_line(candidate, spaced_candidate)
+            })?;
+        if valid_tty_bash_command_candidate(&command) {
             return Some(command);
         }
     }
     None
+}
+
+fn bash_command_from_visible_tty_line(line: &str, spaced_line: &str) -> Option<String> {
+    let first_column = first_tty_column(spaced_line);
+    let command = if valid_tty_bash_command_candidate(&first_column) {
+        first_column
+    } else {
+        line
+    };
+    let command = normalize_tty_bash_command(command);
+    valid_tty_bash_command_candidate(&command).then_some(command)
+}
+
+fn first_tty_column(line: &str) -> &str {
+    let mut spaces = 0_usize;
+    let mut start = None;
+    for (index, ch) in line.char_indices() {
+        if ch == ' ' {
+            spaces += 1;
+            if spaces == 3 {
+                start = Some(index - 2);
+            }
+        } else {
+            if let Some(start) = start {
+                return line[..start].trim();
+            }
+            spaces = 0;
+        }
+    }
+    line.trim()
+}
+
+fn strip_tty_bash_display_suffix(command: &str) -> &str {
+    for suffix in [
+        " Run shell command",
+        " Run command",
+        " Execute shell command",
+        " Execute command",
+    ] {
+        if let Some((before, _)) = command.rsplit_once(suffix) {
+            return before.trim();
+        }
+    }
+    command
+}
+
+fn normalize_tty_bash_command(command: &str) -> String {
+    normalize_tool_command(strip_tty_bash_display_suffix(command))
 }
 
 fn bash_parenthetical_command_from_tty_output(output: &str) -> Option<String> {
@@ -2510,12 +2279,42 @@ fn bash_parenthetical_command_from_tty_output(output: &str) -> Option<String> {
         let Some((command, _)) = after.split_once(')') else {
             continue;
         };
-        let command = normalize_tool_command(command);
-        if !command.is_empty() && !command.contains(":*") {
+        let command = normalize_tty_bash_command(command);
+        if valid_tty_bash_command_candidate(&command) && !command.contains(":*") {
             return Some(command);
         }
     }
     None
+}
+
+fn valid_tty_bash_command_candidate(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || command.chars().any(|ch| ch == '\u{1b}' || ch.is_control()) {
+        return false;
+    }
+    let lower = command.to_ascii_lowercase();
+    if lower.starts_with("execution request")
+        || lower.starts_with("review ")
+        || lower.starts_with("request ")
+    {
+        return false;
+    }
+    let words = lower
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() <= 4
+        && words.iter().all(|word| {
+            matches!(
+                *word,
+                "bash" | "command" | "execution" | "request" | "review" | "approval"
+            )
+        })
+    {
+        return false;
+    }
+    true
 }
 
 fn file_tool_use_from_tty_permission_prompt(output: &str, tool_use_id: String) -> Option<ToolUse> {
@@ -2630,6 +2429,9 @@ async fn apply_permission_decision(
     tool_use: &ToolUse,
     control_response: &Value,
 ) -> Result<bool> {
+    if tool_use.name == "ExitPlanMode" {
+        return apply_exit_plan_mode_decision(process, control_response).await;
+    }
     if tool_use.name == "AskUserQuestion" {
         return apply_ask_user_question_decision(process, tool_use, control_response).await;
     }
@@ -2654,6 +2456,39 @@ async fn apply_permission_decision(
         }
     } else if saw_prompt {
         process.write_all(b"1\r")?;
+    }
+    Ok(denied)
+}
+
+async fn apply_exit_plan_mode_decision(
+    process: &mut PtyProcess,
+    control_response: &Value,
+) -> Result<bool> {
+    let behavior = permission_behavior(control_response)
+        .unwrap_or_else(|| "allow".to_owned())
+        .to_ascii_lowercase();
+    let denied = matches!(behavior.as_str(), "deny" | "decline" | "cancel" | "error");
+    let saw_prompt = wait_for_tty_plan_approval_prompt(process).await;
+    if denied {
+        if saw_prompt {
+            let feedback = permission_deny_message(control_response);
+            if feedback.is_some()
+                && tty_plan_approval_prompt_has_feedback_choice(&process.recent_output())
+            {
+                process.write_all(b"4\r")?;
+                if wait_for_tty_permission_feedback_prompt(process).await
+                    && let Some(message) = feedback
+                {
+                    process.write_all(&bracketed_paste_input(&message))?;
+                }
+            } else {
+                process.write_all(b"3\r")?;
+            }
+        } else {
+            process.write_all(b"\x1b")?;
+        }
+    } else if saw_prompt {
+        process.write_all(exit_plan_mode_allow_selection(control_response))?;
     }
     Ok(denied)
 }
@@ -2695,6 +2530,51 @@ fn ask_user_question_feedback_from_response(
         }
     }
     ask_user_question_default_feedback(&tool_use.input)
+}
+
+fn ask_user_question_feedback_from_mcp_response(
+    mcp_response: &Value,
+    input: &Value,
+) -> Option<String> {
+    let body = mcp_response.get("result").unwrap_or(mcp_response);
+    for candidate in question_answer_candidates(body) {
+        if let Some(feedback) = feedback_from_answers(candidate.get("answers")) {
+            return Some(feedback);
+        }
+        if let Some(answer) = mcp_text_content(candidate.get("content")) {
+            return Some(answer);
+        }
+        if let Some(feedback) = feedback_from_answers(candidate.get("content")) {
+            return Some(feedback);
+        }
+    }
+    ask_user_question_default_feedback(input)
+}
+
+fn sdk_ask_user_question_input(input: &Value) -> Value {
+    let mut rewritten = input.clone();
+    let Some(questions) = rewritten.get_mut("questions").and_then(Value::as_array_mut) else {
+        return rewritten;
+    };
+    for question in questions {
+        let Some(options) = question.get_mut("options").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let flattened = options
+            .iter()
+            .filter_map(|option| {
+                option.as_str().map(ToOwned::to_owned).or_else(|| {
+                    option
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            })
+            .map(Value::String)
+            .collect::<Vec<_>>();
+        *options = flattened;
+    }
+    rewritten
 }
 
 fn ask_user_question_default_feedback(input: &Value) -> Option<String> {
@@ -2829,6 +2709,62 @@ fn question_feedback_from_response(
         .map(|answer| format!("用户回答：{answer}"))
 }
 
+fn question_feedback_from_mcp_response(
+    mcp_response: &Value,
+    question: &TtyQuestion,
+) -> Option<String> {
+    let body = mcp_response.get("result").unwrap_or(mcp_response);
+    for candidate in question_answer_candidates(body) {
+        if let Some(feedback) = feedback_from_answers(candidate.get("answers")) {
+            return Some(feedback);
+        }
+        if let Some(answer) = mcp_text_content(candidate.get("content")) {
+            return Some(answer);
+        }
+        if let Some(feedback) = feedback_from_answers(candidate.get("content")) {
+            return Some(feedback);
+        }
+        if let Some(answer) = candidate
+            .get("answer")
+            .or_else(|| candidate.get("value"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(format!("用户回答：{answer}"));
+        }
+    }
+    question_answer_from_mcp_response(mcp_response, &question.question)
+        .map(|answer| format!("用户回答：{answer}"))
+}
+
+fn mcp_text_content(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_owned())
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(Value::as_str) == Some("text") {
+                        item.get("text").and_then(Value::as_str)
+                    } else {
+                        item.as_str()
+                    }
+                })
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn feedback_from_answers(value: Option<&Value>) -> Option<String> {
     let value = value?;
     if let Some(text) = value
@@ -2915,6 +2851,19 @@ fn question_answer_from_response(control_response: &Value, question: &str) -> Op
     None
 }
 
+fn question_answer_from_mcp_response(mcp_response: &Value, question: &str) -> Option<String> {
+    let body = mcp_response.get("result").unwrap_or(mcp_response);
+    for candidate in question_answer_candidates(body) {
+        if let Some(answer) = answer_from_question_map(candidate.get("answers"), question) {
+            return Some(answer);
+        }
+        if let Some(answer) = answer_from_question_map(candidate.get("content"), question) {
+            return Some(answer);
+        }
+    }
+    None
+}
+
 fn question_answer_candidates(body: &Value) -> Vec<&Value> {
     [
         body.get("updatedInput"),
@@ -2949,6 +2898,57 @@ fn deny_selection_for_tty_permission_prompt(output: &str, tool_use: &ToolUse) ->
     }
 }
 
+fn exit_plan_mode_allow_selection(control_response: &Value) -> &'static [u8] {
+    let Some(mode) = permission_response_target_mode(control_response) else {
+        return b"2\r";
+    };
+    match mode.replace(['-', '_'], "").to_ascii_lowercase().as_str() {
+        "acceptedits" | "auto" | "bypasspermissions" | "dontask" => b"1\r",
+        _ => b"2\r",
+    }
+}
+
+fn permission_response_target_mode(control_response: &Value) -> Option<String> {
+    let body = control_response
+        .get("response")
+        .and_then(|response| response.get("response"))?;
+    for value in [
+        body.get("updated_input"),
+        body.get("updatedInput"),
+        body.get("input"),
+        Some(body),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for key in [
+            "_targetMode",
+            "targetMode",
+            "mode",
+            "permissionMode",
+            "permission_mode",
+        ] {
+            if let Some(mode) = value.get(key).and_then(Value::as_str) {
+                return Some(mode.to_owned());
+            }
+        }
+    }
+    for key in ["updated_permissions", "updatedPermissions"] {
+        if let Some(permissions) = body.get(key).and_then(Value::as_array) {
+            for permission in permissions {
+                let is_set_mode = permission
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("setMode"));
+                if is_set_mode && let Some(mode) = permission.get("mode").and_then(Value::as_str) {
+                    return Some(mode.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
 async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse) -> bool {
     let started = Instant::now();
     while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
@@ -2964,6 +2964,25 @@ async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse
     logging::event(format!(
         "permission_prompt_miss tool={} recent={}",
         single_line_log_text(&tool_use.name),
+        single_line_log_text(&recent_tty_log_text(&process.recent_output(), 800))
+    ));
+    false
+}
+
+async fn wait_for_tty_plan_approval_prompt(process: &PtyProcess) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < PERMISSION_PROMPT_TIMEOUT {
+        let output = process.recent_output();
+        if tty_output_has_plan_approval_prompt(&output) {
+            return true;
+        }
+        if tty_output_accepts_prompt(&output) && !tty_output_has_plan_approval_prompt(&output) {
+            return false;
+        }
+        tokio::time::sleep(TRANSCRIPT_POLL).await;
+    }
+    logging::event(format!(
+        "plan_approval_prompt_miss recent={}",
         single_line_log_text(&recent_tty_log_text(&process.recent_output(), 800))
     ));
     false
@@ -3106,15 +3125,47 @@ fn plain_tty_output_has_generic_permission_prompt(output: &str) -> bool {
     has_allow_choice && has_deny_choice && has_controls && has_permission_language
 }
 
+fn tty_output_has_plan_approval_prompt(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    let has_plan_language = output.contains("Claude has written up a plan")
+        || output.contains("Claude wrote up a plan")
+        || output.contains("ready to execute")
+        || compact.contains("Claudehaswrittenupaplan")
+        || compact.contains("Claudewroteupaplan")
+        || compact.contains("readytoexecute");
+    let has_question = output.contains("Would you like to proceed")
+        || output.contains("Would you like Claude to proceed")
+        || compact.contains("Wouldyouliketoproceed")
+        || compact.contains("WouldyoulikeClaudetoproceed");
+    let has_allow_choice = output.contains("Yes, and use auto mode")
+        || output.contains("Yes, manually approve edits")
+        || compact.contains("Yesanduseautomode")
+        || compact.contains("Yesmanuallyapproveedits");
+    let has_deny_choice = output.contains("No, refine")
+        || output.contains("Tell Claude what to change")
+        || compact.contains("Norefine")
+        || compact.contains("TellClaudewhattochange");
+    has_plan_language && has_question && has_allow_choice && has_deny_choice
+}
+
+fn tty_plan_approval_prompt_has_feedback_choice(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    output.contains("Tell Claude what to change") || compact.contains("TellClaudewhattochange")
+}
+
 fn tty_output_has_permission_feedback_prompt(output: &str) -> bool {
     let output = plain_tty_output(output);
     let compact = compact_tty_output(&output);
     output.contains("tell Claude what to do differently")
         || output.contains("Tell Claude what to do differently")
+        || output.contains("Tell Claude what to change")
         || output.contains("What should Claude do")
         || output.contains("reason")
         || compact.contains("tellClaudewhattododifferently")
         || compact.contains("TellClaudewhattododifferently")
+        || compact.contains("TellClaudewhattochange")
 }
 
 fn tty_output_has_question_feedback_prompt(output: &str) -> bool {
@@ -3471,326 +3522,6 @@ fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
     compact_tty_output(&plain).contains(tail)
 }
 
-fn compact_tty_output(output: &str) -> String {
-    output.split_whitespace().collect()
-}
-
-fn plain_tty_output(output: &str) -> String {
-    let mut plain = String::with_capacity(output.len());
-    let mut chars = output.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            strip_ansi_sequence(&mut chars);
-            plain.push(' ');
-        } else if ch.is_control() {
-            plain.push(' ');
-        } else {
-            plain.push(ch);
-        }
-    }
-    plain.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn recent_tty_log_text(output: &str, max_chars: usize) -> String {
-    plain_tty_output(output)
-        .chars()
-        .rev()
-        .take(max_chars)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-}
-
-fn single_line_log_text(text: &str) -> String {
-    text.chars()
-        .flat_map(|ch| match ch {
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect(),
-            '\t' => "\\t".chars().collect(),
-            other if other.is_control() => format!("\\u{{{:x}}}", other as u32).chars().collect(),
-            other => vec![other],
-        })
-        .collect()
-}
-
-fn visible_tty_lines(output: &str) -> Vec<String> {
-    let mut chars = output.chars().peekable();
-    let mut line = Vec::<char>::new();
-    let mut column = 0_usize;
-    let mut lines = Vec::<String>::new();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            apply_ansi_sequence_to_line(&mut chars, &mut line, &mut column);
-        } else if ch == '\r' {
-            column = 0;
-        } else if ch == '\r' || ch == '\n' {
-            push_visible_line(&mut lines, &mut line);
-            column = 0;
-        } else if ch.is_control() {
-            write_visible_char(&mut line, &mut column, ' ');
-        } else {
-            write_visible_char(&mut line, &mut column, ch);
-        }
-    }
-    push_visible_line(&mut lines, &mut line);
-    lines
-}
-
-fn push_visible_line(lines: &mut Vec<String>, line: &mut Vec<char>) {
-    let rendered = normalize_tool_command(&line.iter().collect::<String>());
-    if !rendered.is_empty() {
-        lines.push(rendered);
-    }
-    line.clear();
-}
-
-fn write_visible_char(line: &mut Vec<char>, column: &mut usize, ch: char) {
-    if *column >= line.len() {
-        line.resize(*column + 1, ' ');
-    }
-    line[*column] = ch;
-    *column += 1;
-}
-
-fn apply_ansi_sequence_to_line<I>(
-    chars: &mut std::iter::Peekable<I>,
-    line: &mut Vec<char>,
-    column: &mut usize,
-) where
-    I: Iterator<Item = char>,
-{
-    match chars.peek().copied() {
-        Some('[') => {
-            chars.next();
-            let mut sequence = String::new();
-            for ch in chars.by_ref() {
-                sequence.push(ch);
-                if ('@'..='~').contains(&ch) {
-                    break;
-                }
-            }
-            apply_csi_sequence_to_line(&sequence, line, column);
-        }
-        Some(']') => {
-            chars.next();
-            for ch in chars.by_ref() {
-                if ch == '\u{7}' {
-                    break;
-                }
-            }
-        }
-        Some(_) => {
-            chars.next();
-        }
-        None => {}
-    }
-}
-
-fn apply_csi_sequence_to_line(sequence: &str, line: &mut Vec<char>, column: &mut usize) {
-    let Some(command) = sequence.chars().last() else {
-        return;
-    };
-    let amount = sequence
-        .trim_end_matches(command)
-        .split(';')
-        .next()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    match command {
-        'G' | '`' => {
-            *column = amount.saturating_sub(1);
-        }
-        'C' => {
-            *column += amount;
-        }
-        'D' => {
-            *column = column.saturating_sub(amount);
-        }
-        'K' => {
-            line.truncate((*column).min(line.len()));
-        }
-        _ => {}
-    }
-}
-
-fn strip_ansi_sequence<I>(chars: &mut std::iter::Peekable<I>)
-where
-    I: Iterator<Item = char>,
-{
-    match chars.peek().copied() {
-        Some('[') => {
-            chars.next();
-            for ch in chars.by_ref() {
-                if ('@'..='~').contains(&ch) {
-                    break;
-                }
-            }
-        }
-        Some(']') => {
-            chars.next();
-            for ch in chars.by_ref() {
-                if ch == '\u{7}' {
-                    break;
-                }
-            }
-        }
-        Some(_) => {
-            chars.next();
-        }
-        None => {}
-    }
-}
-
-fn resolve_claude_path() -> Result<String> {
-    let own_exe = std::env::current_exe().ok();
-    let current_dir = std::env::current_dir().ok();
-    resolve_claude_path_from(
-        own_exe.as_deref(),
-        current_dir.as_deref(),
-        std::env::var_os("CCTTY_CLAUDE_PATH"),
-        std::env::var_os("CONDUCTOR_AGENT_BINARIES_DIR"),
-        std::env::var_os("PATH"),
-    )
-}
-
-fn resolve_claude_path_from(
-    own_exe: Option<&Path>,
-    current_dir: Option<&Path>,
-    explicit_path: Option<OsString>,
-    conductor_agent_binaries_dir: Option<OsString>,
-    path_env: Option<OsString>,
-) -> Result<String> {
-    let own_exe = own_exe.and_then(canonical_path);
-    if let Some(path) = explicit_path
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        return usable_claude_candidate(&path, own_exe.as_deref()).ok_or_else(|| {
-            CcttyError::ClaudeNotFound(format!(
-                "CCTTY_CLAUDE_PATH points to unusable Claude binary: {}",
-                path.display()
-            ))
-        });
-    }
-
-    for candidate in current_dir_claude_candidates(current_dir) {
-        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
-            logging::event(format!("claude_resolved source=current_dir path={path}"));
-            return Ok(path);
-        }
-    }
-
-    for candidate in relative_claude_candidates(own_exe.as_deref()) {
-        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
-            logging::event(format!("claude_resolved source=relative path={path}"));
-            return Ok(path);
-        }
-    }
-
-    for candidate in conductor_agent_binary_candidates(conductor_agent_binaries_dir) {
-        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
-            logging::event(format!("claude_resolved source=conductor path={path}"));
-            return Ok(path);
-        }
-    }
-
-    for candidate in path_claude_candidates(path_env) {
-        if let Some(path) = usable_claude_candidate(&candidate, own_exe.as_deref()) {
-            logging::event(format!("claude_resolved source=path path={path}"));
-            return Ok(path);
-        }
-    }
-
-    Err(CcttyError::ClaudeNotFound(
-        "no usable real Claude binary found via CCTTY_CLAUDE_PATH, current directory, cctty-relative paths, Conductor agent-binaries, or PATH"
-            .to_owned(),
-    ))
-}
-
-fn current_dir_claude_candidates(current_dir: Option<&Path>) -> Vec<PathBuf> {
-    let Some(dir) = current_dir else {
-        return Vec::new();
-    };
-    ["claude.real", "claude.orig", "claude-code", "claude"]
-        .into_iter()
-        .map(|name| dir.join(name))
-        .collect()
-}
-
-fn relative_claude_candidates(own_exe: Option<&Path>) -> Vec<PathBuf> {
-    let Some(dir) = own_exe.and_then(Path::parent) else {
-        return Vec::new();
-    };
-    [
-        "claude.real",
-        "claude.orig",
-        "claude-code",
-        "claude",
-        "../claude/claude",
-        "../claude-code/claude",
-        "../vendor/claude-code/claude",
-    ]
-    .into_iter()
-    .map(|name| dir.join(name))
-    .collect()
-}
-
-fn conductor_agent_binary_candidates(dir: Option<OsString>) -> Vec<PathBuf> {
-    let Some(root) = dir.map(PathBuf::from).filter(|path| path.is_dir()) else {
-        return Vec::new();
-    };
-    let claude_root = root.join("claude");
-    let mut candidates = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&claude_root) {
-        for entry in entries.flatten() {
-            candidates.push(entry.path().join("claude"));
-        }
-    }
-    candidates.sort_by(|left, right| right.cmp(left));
-    candidates
-}
-
-fn path_claude_candidates(path_env: Option<OsString>) -> Vec<PathBuf> {
-    path_env
-        .map(|value| {
-            std::env::split_paths(&value)
-                .map(|dir| dir.join("claude"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn usable_claude_candidate(path: &Path, own_exe: Option<&Path>) -> Option<String> {
-    let canonical = canonical_path(path)?;
-    if own_exe.is_some_and(|own| own == canonical) {
-        return None;
-    }
-    is_executable_file(&canonical).then(|| canonical.to_string_lossy().to_string())
-}
-
-fn canonical_path(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path).ok()
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 struct TailCursor {
     path: Option<PathBuf>,
     config_dir: PathBuf,
@@ -3798,10 +3529,16 @@ struct TailCursor {
     offset: u64,
     attach_existing: bool,
     started_at: SystemTime,
+    session_alias: SessionIdAlias,
 }
 
 impl TailCursor {
-    fn new(path: Option<PathBuf>, config_dir: &Path, attach_existing: bool) -> Result<Self> {
+    fn new(
+        path: Option<PathBuf>,
+        config_dir: &Path,
+        attach_existing: bool,
+        session_alias: SessionIdAlias,
+    ) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let project_dir = config_dir
@@ -3814,6 +3551,7 @@ impl TailCursor {
             offset: 0,
             attach_existing,
             started_at: SystemTime::now(),
+            session_alias,
         })
     }
 
@@ -3848,6 +3586,10 @@ impl TailCursor {
         self.offset = 0;
         self.attach_existing = false;
         self.started_at = SystemTime::now();
+    }
+
+    fn externalize_value(&self, value: &mut Value) {
+        self.session_alias.externalize_value(value);
     }
 
     fn remove_current_transcript(&self) -> Result<()> {
@@ -4007,85 +3749,75 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_sdk_ask_user_question_mcp_tool_name_for_claude() {
+    fn extracts_question_feedback_from_mcp_text_content() {
+        let question = TtyQuestion {
+            question: "Which style?".to_owned(),
+            header: "Style".to_owned(),
+            options: vec![TtyQuestionOption {
+                label: "APA".to_owned(),
+                description: "American Psychological Association".to_owned(),
+                special: false,
+            }],
+        };
         let response = json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": "1",
             "result": {
-                "tools": [
-                    { "name": "AskUserQuestion" },
-                    { "name": "GetWorkspaceDiff" }
+                "content": [
+                    { "type": "text", "text": "User responses:\n1. 技术设计" }
                 ]
             }
         });
-        let rewritten = rewrite_mcp_tools_for_claude(response);
-        assert_eq!(rewritten["result"]["tools"][0]["name"], "ask_user_question");
-        assert_eq!(rewritten["result"]["tools"][1]["name"], "GetWorkspaceDiff");
+
+        assert_eq!(
+            question_feedback_from_mcp_response(&response, &question).as_deref(),
+            Some("User responses:\n1. 技术设计")
+        );
     }
 
     #[test]
-    fn rewrites_claude_ask_user_question_mcp_tool_call_for_sdk() {
-        let message = json!({
+    fn extracts_ask_user_question_feedback_from_mcp_text_content() {
+        let input = json!({
+            "questions": [
+                {
+                    "question": "Which style?",
+                    "options": [{ "label": "APA", "description": "American Psychological Association" }]
+                }
+            ]
+        });
+        let response = json!({
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "ask_user_question",
-                "arguments": {}
+            "id": "1",
+            "result": {
+                "content": [
+                    { "type": "text", "text": "User responses:\n1. 技术设计" }
+                ]
             }
         });
-        let rewritten = rewrite_mcp_tool_call_for_sdk(message);
-        assert_eq!(rewritten["params"]["name"], "AskUserQuestion");
-    }
-
-    #[test]
-    fn resolves_real_claude_from_current_directory_before_path() {
-        let current = tempfile::tempdir().unwrap();
-        let path_dir = tempfile::tempdir().unwrap();
-        let own = current.path().join("cctty");
-        let current_claude = current.path().join("claude");
-        let path_claude = path_dir.path().join("claude");
-        write_executable(&own);
-        write_executable(&current_claude);
-        write_executable(&path_claude);
-
-        let resolved = resolve_claude_path_from(
-            Some(&own),
-            Some(current.path()),
-            None,
-            None,
-            Some(OsString::from(path_dir.path().as_os_str())),
-        )
-        .unwrap();
 
         assert_eq!(
-            resolved,
-            std::fs::canonicalize(current_claude)
-                .unwrap()
-                .to_string_lossy()
+            ask_user_question_feedback_from_mcp_response(&response, &input).as_deref(),
+            Some("User responses:\n1. 技术设计")
         );
     }
 
     #[test]
-    fn skips_cctty_itself_when_resolving_path_claude() {
-        let current = tempfile::tempdir().unwrap();
-        let path_dir = tempfile::tempdir().unwrap();
-        let own = current.path().join("claude");
-        let path_claude = path_dir.path().join("claude");
-        write_executable(&own);
-        write_executable(&path_claude);
-        let path_env = std::env::join_paths([current.path(), path_dir.path()]).unwrap();
+    fn flattens_ask_user_question_options_for_sdk_mcp() {
+        let input = json!({
+            "questions": [
+                {
+                    "question": "Which style?",
+                    "options": [
+                        { "label": "APA", "description": "American Psychological Association" },
+                        "MLA"
+                    ]
+                }
+            ]
+        });
 
-        let resolved =
-            resolve_claude_path_from(Some(&own), Some(current.path()), None, None, Some(path_env))
-                .unwrap();
+        let rewritten = sdk_ask_user_question_input(&input);
 
-        assert_eq!(
-            resolved,
-            std::fs::canonicalize(path_claude)
-                .unwrap()
-                .to_string_lossy()
-        );
+        assert_eq!(rewritten["questions"][0]["options"], json!(["APA", "MLA"]));
     }
 
     #[test]
@@ -4129,6 +3861,44 @@ mod tests {
         assert_eq!(
             bash_command_from_tty_permission_prompt(output).as_deref(),
             Some("printf cctty-live-permission-allow")
+        );
+    }
+
+    #[test]
+    fn ignores_bash_permission_title_without_command() {
+        let output = "\
+            Review bash command execution request \
+            Do you want to allow Bash? \
+            ❯ 1. Yes 2. No Esc to cancel";
+
+        assert_eq!(bash_command_from_tty_permission_prompt(output), None);
+        assert!(tool_use_from_tty_permission_prompt(output, "tool-1".to_owned()).is_none());
+    }
+
+    #[test]
+    fn strips_tty_bash_description_column() {
+        let output = "\
+            Bash command\r\n\
+            \u{1b}[1Gprintf CCTTY_PERMISSION_FILE_OK > file.txt\u{1b}[64GRun shell command\r\n\
+            Permission rule Bash(printf:*) requires confirmation for this command.\r\n\
+            Do you want to proceed? ❯ 1. Yes 2. No Esc to cancel";
+
+        assert_eq!(
+            bash_command_from_tty_permission_prompt(output).as_deref(),
+            Some("printf CCTTY_PERMISSION_FILE_OK > file.txt")
+        );
+    }
+
+    #[test]
+    fn strips_flat_tty_bash_display_suffix() {
+        let output = "\
+            Bash command printf CCTTY_PERMISSION_FILE_OK > file.txt Run shell command \
+            Permission rule Bash(printf:*) requires confirmation for this command. \
+            Do you want to proceed? ❯ 1. Yes 2. No Esc to cancel";
+
+        assert_eq!(
+            bash_command_from_tty_permission_prompt(output).as_deref(),
+            Some("printf CCTTY_PERMISSION_FILE_OK > file.txt")
         );
     }
 
@@ -4192,6 +3962,124 @@ mod tests {
     }
 
     #[test]
+    fn detects_tty_plan_approval_prompt() {
+        let output = "\
+            Plan Mode Test\r\n\
+            Context\r\n\
+            This is a test of the plan mode workflow.\r\n\
+            Plan\r\n\
+            1. Reply with CCTTY_PLAN_OK after approval.\r\n\
+            Claude has written up a plan and is ready to execute. Would you like to proceed?\r\n\
+            ❯ 1. Yes, and use auto mode\r\n\
+              2. Yes, manually approve edits\r\n\
+              3. No, refine with more details\r\n\
+              4. Tell Claude what to change\r\n\
+            Enter to confirm · Esc to cancel";
+
+        assert!(tty_output_has_plan_approval_prompt(output));
+        assert!(tty_plan_approval_prompt_has_feedback_choice(output));
+        let tool_use =
+            tool_use_from_tty_plan_approval_prompt(output, "tool-plan-approval".to_owned(), None)
+                .expect("plan prompt should synthesize ExitPlanMode");
+        assert_eq!(tool_use.name, "ExitPlanMode");
+        assert!(
+            tool_use.input["plan"]
+                .as_str()
+                .unwrap()
+                .contains("CCTTY_PLAN_OK")
+        );
+        let clean_plan = json!({
+            "plan": "# Clean Plan\n\n1. Continue.",
+            "planFilePath": "/Users/test/.claude/plans/plan-mode-test.md"
+        });
+        let tool_use = tool_use_from_tty_plan_approval_prompt(
+            output,
+            "tool-plan-clean".to_owned(),
+            Some(&clean_plan),
+        )
+        .expect("plan prompt should use cached clean plan input");
+        assert_eq!(tool_use.input, clean_plan);
+    }
+
+    #[test]
+    fn skips_internal_claude_plan_file_write() {
+        let plan_write = ToolUse {
+            id: "tool-plan-write".to_owned(),
+            name: "Write".to_owned(),
+            input: json!({
+                "file_path": "/Users/test/.claude/plans/plan-mode-test.md",
+                "content": "# Plan"
+            }),
+        };
+        let project_write = ToolUse {
+            id: "tool-project-write".to_owned(),
+            name: "Write".to_owned(),
+            input: json!({
+                "file_path": "/workspace/.claude/plans-not-in-home.md",
+                "content": "# Not internal"
+            }),
+        };
+
+        assert!(is_internal_claude_plan_write(&plan_write));
+        assert!(!is_internal_claude_plan_write(&project_write));
+        assert_eq!(
+            internal_plan_input_from_write(&plan_write)
+                .unwrap()
+                .get("plan")
+                .and_then(Value::as_str),
+            Some("# Plan")
+        );
+    }
+
+    #[test]
+    fn skips_internal_exit_plan_tool_search() {
+        let tool_search = ToolUse {
+            id: "tool-search-exit-plan".to_owned(),
+            name: "ToolSearch".to_owned(),
+            input: json!({ "query": "select:ExitPlanMode" }),
+        };
+        let other_tool_search = ToolUse {
+            id: "tool-search-other".to_owned(),
+            name: "ToolSearch".to_owned(),
+            input: json!({ "query": "select:SomethingElse" }),
+        };
+
+        assert!(is_internal_exit_plan_tool_search(&tool_search));
+        assert!(!is_internal_exit_plan_tool_search(&other_tool_search));
+    }
+
+    #[test]
+    fn chooses_manual_plan_approval_by_default() {
+        let response = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "cctty_permission_1",
+                "response": { "behavior": "allow" }
+            }
+        });
+
+        assert_eq!(exit_plan_mode_allow_selection(&response), b"2\r");
+    }
+
+    #[test]
+    fn chooses_auto_plan_approval_for_accept_edits_target() {
+        let response = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "cctty_permission_1",
+                "response": {
+                    "behavior": "allow",
+                    "updated_input": { "_targetMode": "acceptEdits" }
+                }
+            }
+        });
+
+        assert_eq!(exit_plan_mode_allow_selection(&response), b"1\r");
+    }
+
+    #[test]
     fn parses_tty_ask_user_question_form() {
         let output = "\
             ← ☐ 文档类型 ☐ 目标读者 ☐ 语言 ☐ 输出位置 ✔ Submit → \
@@ -4222,6 +4110,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_tty_ask_user_question_form_after_noisy_screen() {
+        let output = "\
+            Claude Code v2.1.156 Tips for getting started Remote Control failed \
+            [Sonnet 4.6] │ workspace 0 tokens Context ░░░░░░░░░░ 0% \
+            Use the AskUserQuestion tool to ask me which document style to use. \
+            ☐ 文档风格 请选择文档风格： \
+            ❯ 1. 技术设计 技术设计文档风格 \
+            2. 操作手册 操作手册文档风格 \
+            3. Type something. \
+            4. Chat about this Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        let question = tty_question_from_form(output).expect("question form should parse");
+
+        assert_eq!(question.header, "文档风格");
+        assert_eq!(question.question, "请选择文档风格：");
+        assert_eq!(question.options[0].label, "技术设计");
+        assert_eq!(question.options[0].description, "技术设计文档风格");
+        assert_eq!(question.options[1].label, "操作手册");
+        assert_eq!(question.options[1].description, "操作手册文档风格");
+    }
+
+    #[test]
+    fn keeps_english_question_leader_in_tty_question_prompt() {
+        let output = "\
+            ← ☐ Doc type ✔ Submit → \
+            What kind of document do you want? \
+            ❯ 1. Technical design Architecture and implementation details \
+            2. Product brief Audience, goals, and scope \
+            3. Type something. \
+            4. Chat about this Enter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        let question = tty_question_from_form(output).expect("question form should parse");
+
+        assert_eq!(question.header, "Doc type");
+        assert_eq!(question.question, "What kind of document do you want?");
+    }
+
+    #[test]
     fn parses_tty_permission_command_from_bash_command_fallback() {
         let output = "\
             Bash command echo tty fake \
@@ -4232,16 +4156,5 @@ mod tests {
             bash_command_from_tty_permission_prompt(output).as_deref(),
             Some("echo tty fake")
         );
-    }
-
-    fn write_executable(path: &Path) {
-        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).unwrap();
-        }
     }
 }

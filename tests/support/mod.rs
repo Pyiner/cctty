@@ -521,6 +521,54 @@ while True:
             after += 1
         buf = buf[after:]
         continue
+    if "USE_FAKE_PLAN_MODE" in prompt:
+        plan_path = "/Users/test/.claude/plans/fake-plan.md"
+        plan_text = "Fake Plan\n\n1. Continue after approval."
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-plan-write-1","name":"Write","input":{"file_path":plan_path,"content":plan_text}}]}}) + "\n")
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-plan-write-1","content":"File created successfully."}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"tool_use","id":"tool-search-exit-plan-1","name":"ToolSearch","input":{"query":"select:ExitPlanMode"}}]}}) + "\n")
+        sys.stdout.write("Claude has written up a plan and is ready to execute. Would you like to proceed?\n")
+        sys.stdout.write("❯ 1. Yes, and use auto mode\n")
+        sys.stdout.write("  2. Yes, manually approve edits\n")
+        sys.stdout.write("  3. No, refine with more details\n")
+        sys.stdout.write("  4. Tell Claude what to change\n")
+        sys.stdout.write("Enter to confirm · Esc to cancel\n")
+        sys.stdout.flush()
+        ack = os.read(0, 4096)
+        if b"1" in ack:
+            response = "FAKE_PLAN_AUTO_ALLOWED"
+        elif b"2" in ack:
+            response = "FAKE_PLAN_MANUAL_ALLOWED"
+        elif b"4" in ack:
+            sys.stdout.write("Tell Claude what to change\n")
+            sys.stdout.flush()
+            ready, _, _ = select.select([0], [], [], 2)
+            feedback = ""
+            if ready:
+                feedback_bytes = os.read(0, 4096)
+                start_feedback = feedback_bytes.find(b"\x1b[200~")
+                end_feedback = feedback_bytes.find(b"\x1b[201~")
+                if start_feedback >= 0 and end_feedback >= 0:
+                    feedback = feedback_bytes[start_feedback + len(b"\x1b[200~"):end_feedback].decode("utf-8", errors="replace")
+                else:
+                    feedback = feedback_bytes.decode("utf-8", errors="replace").strip()
+            response = "FAKE_PLAN_CHANGE_REQUESTED: " + feedback
+        else:
+            response = "FAKE_PLAN_DENIED"
+        with transcript.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-exit-plan-1","content":response}]}}) + "\n")
+            f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
+            f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
     if "USE_FAKE_TOOL" in prompt:
         with transcript.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
