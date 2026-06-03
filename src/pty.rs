@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::error::{CcttyError, Result};
 
@@ -53,6 +54,33 @@ impl PtyProcess {
         unsafe {
             libc::kill(-self.pid, libc::SIGTERM);
             libc::kill(self.pid, libc::SIGTERM);
+        }
+    }
+
+    pub fn terminate(&mut self, timeout: Duration) {
+        if self.pid <= 0 {
+            return;
+        }
+        let pid = self.pid;
+        self.kill();
+        let started = Instant::now();
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result == pid || result < 0 {
+                self.pid = 0;
+                return;
+            }
+            if started.elapsed() >= timeout {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                self.pid = 0;
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }

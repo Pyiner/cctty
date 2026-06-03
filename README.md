@@ -351,7 +351,7 @@ keeps owning its own SDK, ACP, editor, or orchestration protocol.
 | `claude-agent-sdk` | Official Python Claude Agent SDK | Supported | `ClaudeAgentOptions(cli_path="cctty")` | Deterministic SDK test with fake Claude; live mini-game write test under `permission_mode="default"` with SDK `can_use_tool` approvals. | Same result metadata and synthetic partial-message limits as TypeScript. |
 | Hermes Agent | OpenAI-like agent runtime with a Claude SDK provider | Supported on the cctty branch | Select provider `claude-sdk` or alias `cctty`; set `HERMES_CLAUDE_SDK_COMMAND=/path/to/cctty` or `CCTTY_CLI_PATH=/path/to/cctty`. | Hermes unit coverage for provider routing and a local `ClaudeSDKClient` smoke through cctty. `copilot-acp` remains separate. | Upstream release has to include the `claude-sdk` provider path; cctty does not implement Hermes' ACP adapter. |
 | NanoClaw / NanoBot (`qwibitai/nanoclaw`) | Containerized TypeScript Agent SDK runner | Core supported; project integration needs a path override | Its runner passes `pathToClaudeCodeExecutable` to the SDK, but currently hard-codes `/pnpm/claude`. Patch NanoClaw to expose that setting, or install/symlink cctty at `/pnpm/claude` inside the agent image and set `CCTTY_CLAUDE_PATH` to the real Claude binary. | Source inspected at commit `0683c6e` / `nanoclaw@2.0.64`; NanoClaw-pinned `@anthropic-ai/claude-agent-sdk@0.2.138` smoke passed with cctty. | Full container/session runtime not run. Upstream should expose the executable path as config. |
-| `@agentclientprotocol/claude-agent-acp` | ACP server powered by the TypeScript Claude Agent SDK | Supported as a core executable override | Set `CLAUDE_CODE_EXECUTABLE=/path/to/cctty` in the ACP adapter environment. | `0.36.1` smoke passed through `acpx`, including SDK initialization metadata, `includePartialMessages`, and idle session-state handling. | ACP behavior belongs to the adapter. cctty only supplies the Claude executable behind it. Dynamic `set_model` / `set_permission_mode` control requests are compatibility-acknowledged; the underlying TTY run still comes from the CLI args/settings used at launch. |
+| `@agentclientprotocol/claude-agent-acp` | ACP server powered by the TypeScript Claude Agent SDK | Supported as a core executable override | Set `CLAUDE_CODE_EXECUTABLE=/path/to/cctty` in the ACP adapter environment. | `0.36.1` smoke passed through `acpx`, including SDK initialization metadata, `includePartialMessages`, idle session-state handling, SDK MCP proxying, and dynamic `set_model` / `set_permission_mode` argument updates. | ACP behavior belongs to the adapter. cctty only supplies the Claude executable behind it. |
 | `@zed-industries/claude-code-acp` | Deprecated ACP server powered by the TypeScript Claude Agent SDK | Supported as a core executable override | Set `CLAUDE_CODE_EXECUTABLE=/path/to/cctty` in the ACP adapter environment. | `0.16.2` smoke passed through `acpx`. npm marks this package deprecated in favor of `@agentclientprotocol/claude-agent-acp`. | Same boundary as above: keep the ACP adapter, replace only its Claude executable. |
 | `acp-claude-code` | ACP bridge for Claude Code | Conditional | Set `ACP_PATH_TO_CLAUDE_CODE_EXECUTABLE=/path/to/cctty`. | `0.8.0` path override works. A smoke passed with the older SDK-exporting `@anthropic-ai/claude-code@1.0.128` dependency and fake Claude under cctty. | A fresh install currently resolves `@anthropic-ai/claude-code: latest` to a CLI-only package, so the wrapper can fail before cctty starts. This is a wrapper dependency issue, not an ACP feature cctty should implement. |
 | `claude-code-acp` / `cc-acp` | Alternate ACP bridge for Claude Code | Unsupported without wrapper changes | No cctty setting found. | `0.1.1` source/package inspected. | The wrapper hard-resolves its bundled `@anthropic-ai/claude-code/cli.js` and ignores `CLAUDE_CODE_EXECUTABLE`; it needs an upstream executable-path option. |
@@ -374,6 +374,13 @@ For SDK permission callbacks, `cctty` consumes the hidden
 `--permission-prompt-tool stdio` flag, emits SDK-style `can_use_tool`
 `control_request` messages, waits for SDK `control_response` decisions, and then
 drives Claude's interactive permission UI with keyboard input.
+
+For SDK host metadata and controls, `cctty` returns Claude-compatible
+initialization metadata including the current model aliases used by Claude Code
+SDK hosts (`default`, `opus`, `haiku`, `sonnet[1m]`, and full model names). When
+the host sends `set_model` or `set_permission_mode` between turns, `cctty`
+updates the underlying Claude launch arguments, restarts the idle TTY, and uses
+the new model or permission mode for the next prompt.
 
 Claude's interactive `AskUserQuestion` forms are bridged through the same SDK
 control channel. When Claude asks a structured question, `cctty` forwards the
@@ -555,7 +562,8 @@ Some SDKs pass flags that are not listed in current `claude --help`.
   differentials before being marked supported.
 - SDK control requests used by popular wrappers are compatibility-acked:
   `initialize`, `interrupt`, `set_model`, `set_permission_mode`,
-  `set_max_thinking_tokens`, `apply_flag_settings`, and `mcp_status`. Dynamic
-  model/mode changes after a TTY session is already running are still partial;
-  the actual Claude process behavior comes from its launch args and local
-  settings.
+  `set_max_thinking_tokens`, `apply_flag_settings`, and `mcp_status`.
+  `set_model` and `set_permission_mode` update the stored launch args and restart
+  the idle TTY for the next user turn. Other flag-setting controls are still
+  compatibility acknowledgements unless they already map to launch-time CLI
+  flags.

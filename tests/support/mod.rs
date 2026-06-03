@@ -25,10 +25,12 @@ fn write_fake_claude_script(path: &Path) {
     fs::write(
         path,
 r#"#!/usr/bin/env python3
+import atexit
 import json
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -150,6 +152,34 @@ session_id = arg_value("--session-id") or arg_value("--resume") or "00000000-000
 config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 transcript = config_dir / "projects" / project_key(Path.cwd()) / f"{session_id}.jsonl"
 transcript.parent.mkdir(parents=True, exist_ok=True)
+
+session_lock_dir = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_DIR")
+session_lock_path = None
+if session_lock_dir:
+    session_lock_path = Path(session_lock_dir) / f"{session_id}.lock"
+    session_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if session_lock_path.exists():
+        print(f"Error: Session ID {session_id} is already in use.")
+        sys.stdout.flush()
+        sys.exit(1)
+    session_lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def release_session_lock():
+        delay_ms = os.environ.get("FAKE_CLAUDE_SESSION_LOCK_RELEASE_DELAY_MS")
+        if delay_ms:
+            time.sleep(int(delay_ms) / 1000)
+        try:
+            session_lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def handle_shutdown_signal(signum, _frame):
+        release_session_lock()
+        sys.exit(128 + signum)
+
+    atexit.register(release_session_lock)
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
 
 startup_delay_ms = os.environ.get("FAKE_CLAUDE_STARTUP_DELAY_MS")
 if startup_delay_ms:

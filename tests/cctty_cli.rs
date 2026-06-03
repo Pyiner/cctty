@@ -169,6 +169,7 @@ fn passes_agent_definition_flags_to_underlying_claude_tty() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
+    let session_lock_dir = tempfile::tempdir().unwrap();
     let argv_path = tempfile::NamedTempFile::new().unwrap();
     let agents =
         r#"{"reviewer":{"description":"Review synthetic code","prompt":"Review carefully"}}"#;
@@ -178,6 +179,8 @@ fn passes_agent_definition_flags_to_underlying_claude_tty() {
         .env("CCTTY_CLAUDE_PATH", fixture.path())
         .env("CLAUDE_CONFIG_DIR", config_dir.path())
         .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_DIR", session_lock_dir.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_RELEASE_DELAY_MS", "250")
         .current_dir(workspace.path())
         .args([
             "--print",
@@ -350,6 +353,16 @@ fn stream_json_initialize_returns_sdk_metadata_for_wrappers() {
         response["response"]["response"]["models"][0]["value"],
         "default"
     );
+    let models = response["response"]["response"]["models"]
+        .as_array()
+        .expect("models should be an array")
+        .iter()
+        .filter_map(|model| model["value"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        models.contains(&"opus"),
+        "expected Conductor default model alias in {models:?}"
+    );
     assert_eq!(
         response["response"]["response"]["available_output_styles"][0],
         "default"
@@ -429,6 +442,75 @@ fn stream_json_accepts_wrapper_control_requests_after_initialize() {
     assert_eq!(
         responses[3]["response"]["response"]["mcpServers"],
         Value::Array(vec![])
+    );
+}
+
+#[test]
+fn stream_json_control_updates_restart_tty_with_new_model_and_permission_mode() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for value in [
+            serde_json::json!({
+                "type": "control_request",
+                "request_id": "model-1",
+                "request": { "subtype": "set_model", "model": "opus" },
+            }),
+            serde_json::json!({
+                "type": "control_request",
+                "request_id": "mode-1",
+                "request": { "subtype": "set_permission_mode", "mode": "plan" },
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "Reply OK" },
+            }),
+        ] {
+            writeln!(stdin, "{value}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "opus"),
+        "argv={argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--permission-mode" && pair[1] == "plan"),
+        "argv={argv:?}"
     );
 }
 
@@ -528,6 +610,201 @@ fn stream_json_python_sdk_mcp_config_round_trips_tool_calls() {
         ],
         serde_json::json!({ "subtype": "initialize", "hooks": null }),
     );
+}
+
+#[test]
+fn stream_json_sdk_mcp_survives_control_restart_between_turns() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000015";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "init-mcp-restart",
+            "request": { "subtype": "initialize", "sdkMcpServers": ["conductor"], "systemPrompt": [""] },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let init_response = read_json_line(&mut reader, &mut line);
+    assert_eq!(init_response["type"], "control_response");
+    assert_eq!(init_response["response"]["request_id"], "init-mcp-restart");
+
+    let (first_methods, first_result) = drive_fake_sdk_mcp_prompt(
+        &mut stdin,
+        &mut reader,
+        &mut line,
+        "USE_FAKE_SDK_MCP_ASK first",
+    );
+    assert_eq!(first_methods, ["initialize", "tools/list", "tools/call"]);
+    assert!(first_result.contains("Technical design"), "{first_result}");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "set-model-after-mcp",
+            "request": { "subtype": "set_model", "model": "opus" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let model_response = read_json_line(&mut reader, &mut line);
+    assert_eq!(model_response["type"], "control_response");
+    assert_eq!(
+        model_response["response"]["request_id"],
+        "set-model-after-mcp"
+    );
+
+    let (second_methods, second_result) = drive_fake_sdk_mcp_prompt(
+        &mut stdin,
+        &mut reader,
+        &mut line,
+        "USE_FAKE_SDK_MCP_ASK second",
+    );
+    assert_eq!(second_methods, ["initialize", "tools/list", "tools/call"]);
+    assert!(second_result.contains("SDK users"), "{second_result}");
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == "opus"),
+        "argv={argv:?}"
+    );
+    let mcp_config_arg = argv
+        .windows(2)
+        .find(|pair| pair[0] == "--mcp-config")
+        .map(|pair| pair[1].clone())
+        .expect("expected rewritten --mcp-config to be passed after restart");
+    assert!(
+        mcp_config_arg.contains("__cctty-mcp-proxy"),
+        "{mcp_config_arg}"
+    );
+}
+
+fn read_json_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value {
+    line.clear();
+    let count = reader.read_line(line).unwrap();
+    assert!(count > 0, "expected JSON line from cctty");
+    serde_json::from_str(line.trim()).unwrap()
+}
+
+fn drive_fake_sdk_mcp_prompt<W: Write, R: BufRead>(
+    stdin: &mut W,
+    reader: &mut R,
+    line: &mut String,
+    prompt: &str,
+) -> (Vec<String>, String) {
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": prompt },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let mut methods = Vec::new();
+    loop {
+        let value = read_json_line(reader, line);
+        match value.get("type").and_then(Value::as_str) {
+            Some("control_request") => {
+                assert_eq!(value["request"]["subtype"], "mcp_message");
+                assert_eq!(value["request"]["server_name"], "conductor");
+                let request_id = value["request_id"].as_str().unwrap();
+                let message = &value["request"]["message"];
+                let method = message["method"].as_str().unwrap_or_default();
+                let id = message["id"].clone();
+                if method != "notifications/initialized" {
+                    methods.push(method.to_owned());
+                }
+                let mcp_response = fake_sdk_mcp_response(method, id, message);
+                writeln!(
+                    stdin,
+                    "{}",
+                    serde_json::json!({
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": request_id,
+                            "response": { "mcp_response": mcp_response },
+                        },
+                    })
+                )
+                .unwrap();
+                stdin.flush().unwrap();
+            }
+            Some("result") => {
+                return (
+                    methods,
+                    value["result"].as_str().unwrap_or_default().to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn fake_sdk_mcp_response(method: &str, id: Value, message: &Value) -> Value {
+    match method {
+        "initialize" => {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": "2024-11-05", "capabilities": { "tools": { "listChanged": true } }, "serverInfo": { "name": "conductor", "version": "test" } } })
+        }
+        "notifications/initialized" => {
+            serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": {} })
+        }
+        "tools/list" => {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [{ "name": "AskUserQuestion", "description": "Ask the user a structured question", "inputSchema": { "type": "object", "properties": { "questions": { "type": "array" } } } }] } })
+        }
+        "tools/call" => {
+            assert_eq!(message["params"]["name"], "AskUserQuestion");
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": "User responses:\n- Document type: Technical design\n- Audience: SDK users" }] } })
+        }
+        other => panic!("unexpected MCP method {other}: {message}"),
+    }
 }
 
 fn assert_sdk_mcp_server_round_trips_tool_calls(extra_args: Vec<String>, initialize: Value) {

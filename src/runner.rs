@@ -27,6 +27,7 @@ const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_PERMISSION_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
 const TTY_QUESTION_FORM_SETTLE: Duration = Duration::from_millis(250);
 const MCP_PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const PTY_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -140,7 +141,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
                 let stripped_args = strip_session_resume_args(&passthrough_args);
                 if stripped_args != passthrough_args {
                     logging::event("tty_restart reason=bad_resume action=strip_resume_args");
-                    process.kill();
+                    process.terminate(PTY_TERMINATE_TIMEOUT);
                     passthrough_args = stripped_args;
                     current_session_id = None;
                     attach_existing = false;
@@ -179,18 +180,18 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
             write_final_output(&outcome, invocation.output_format)?;
         }
         InputFormat::StreamJson => {
-            let stream_spawn = StreamSpawnContext {
+            let mut stream_spawn = StreamSpawnContext {
                 claude: &claude,
                 cwd: &cwd,
                 env: &env,
                 args: passthrough_args.clone(),
-                session_id: &current_session_id,
+                session_id: current_session_id.clone(),
                 invocation: &invocation,
             };
             run_stream_json(
                 &mut process,
                 &mut tail,
-                &stream_spawn,
+                &mut stream_spawn,
                 invocation.output_format,
                 invocation.permission_prompt_tool_stdio,
                 invocation.include_partial_messages,
@@ -199,7 +200,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         }
     }
 
-    process.kill();
+    process.terminate(PTY_TERMINATE_TIMEOUT);
     if invocation.no_session_persistence {
         tail.remove_current_transcript()?;
     }
@@ -308,7 +309,7 @@ struct StreamSpawnContext<'a> {
     cwd: &'a Path,
     env: &'a HashMap<String, String>,
     args: Vec<String>,
-    session_id: &'a Option<String>,
+    session_id: Option<String>,
     invocation: &'a Invocation,
 }
 
@@ -499,13 +500,13 @@ async fn ensure_sdk_mcp_runtime(
     input: &mut mpsc::Receiver<Value>,
     sdk_state: &mut SdkStreamState,
     spawn: &StreamSpawnContext<'_>,
-) -> Result<()> {
+) -> Result<bool> {
     if sdk_state.mcp_runtime.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let servers = sdk_state.sdk_mcp_server_names();
     if servers.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let runtime = create_sdk_mcp_runtime(servers)?;
@@ -520,18 +521,18 @@ async fn ensure_sdk_mcp_runtime(
         sdk_mcp_runtime_servers(&runtime).join(","),
         sanitized_arg_shape(&rewritten_args)
     ));
-    process.kill();
+    process.terminate(PTY_TERMINATE_TIMEOUT);
     *process = spawn_tty_process(
         spawn.claude,
         spawn.cwd,
         spawn.env,
         &rewritten_args,
-        spawn.session_id,
+        &spawn.session_id,
         spawn.invocation,
     )?;
     prepare_tty_for_prompt_with_mcp(process, input, &runtime, sdk_state).await?;
     sdk_state.mcp_runtime = Some(runtime);
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -650,7 +651,7 @@ fn sdk_mcp_proxy_config(_runtime: &SdkMcpRuntime) -> Result<String> {
 async fn run_stream_json(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
     output_format: OutputFormat,
     permission_prompt_tool_stdio: bool,
     include_partial_messages: bool,
@@ -674,14 +675,31 @@ async fn run_stream_json(
         };
         match value.get("type").and_then(Value::as_str) {
             Some("control_request") => {
-                handle_control_request(process, &mut input, &mut sdk_state, spawn, &value).await?
+                handle_control_request(
+                    process,
+                    &mut input,
+                    &mut sdk_state,
+                    spawn,
+                    &mut tty_prepared,
+                    &value,
+                )
+                .await?
             }
             Some("control_response") => {}
             Some("control_cancel_request") => {}
             Some("user") => {
-                ensure_sdk_mcp_runtime(process, &mut input, &mut sdk_state, spawn).await?;
+                if ensure_sdk_mcp_runtime(process, &mut input, &mut sdk_state, spawn).await? {
+                    tty_prepared = true;
+                }
                 if !tty_prepared {
-                    prepare_stream_tty_for_prompt(process, tail, spawn).await?;
+                    prepare_stream_tty_for_prompt_with_sdk_state(
+                        process,
+                        tail,
+                        &mut input,
+                        &mut sdk_state,
+                        spawn,
+                    )
+                    .await?;
                     tty_prepared = true;
                 }
                 let prompt = user_prompt_from_sdk_message(&value)?;
@@ -703,6 +721,24 @@ async fn run_stream_json(
     Ok(())
 }
 
+async fn prepare_stream_tty_for_prompt_with_sdk_state(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    input: &mut mpsc::Receiver<Value>,
+    sdk_state: &mut SdkStreamState,
+    spawn: &StreamSpawnContext<'_>,
+) -> Result<()> {
+    let Some(runtime) = sdk_state.mcp_runtime.take() else {
+        return prepare_stream_tty_for_prompt(process, tail, spawn).await;
+    };
+    let result = prepare_stream_tty_for_prompt_with_mcp_runtime(
+        process, tail, input, &runtime, sdk_state, spawn,
+    )
+    .await;
+    sdk_state.mcp_runtime = Some(runtime);
+    result
+}
+
 async fn prepare_stream_tty_for_prompt(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
@@ -716,7 +752,7 @@ async fn prepare_stream_tty_for_prompt(
                 return Err(error);
             }
             logging::event("tty_restart reason=bad_resume action=strip_resume_args");
-            process.kill();
+            process.terminate(PTY_TERMINATE_TIMEOUT);
             *process = spawn_tty_process(
                 spawn.claude,
                 spawn.cwd,
@@ -726,6 +762,40 @@ async fn prepare_stream_tty_for_prompt(
                 spawn.invocation,
             )?;
             prepare_tty_for_prompt(process).await?;
+            tail.reset_for_new_session();
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    input: &mut mpsc::Receiver<Value>,
+    runtime: &SdkMcpRuntime,
+    sdk_state: &mut SdkStreamState,
+    spawn: &StreamSpawnContext<'_>,
+) -> Result<()> {
+    match prepare_tty_for_prompt_with_mcp(process, input, runtime, sdk_state).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_bad_resume_startup_error(&error) => {
+            let stripped_args = strip_session_resume_args(&spawn.args);
+            if stripped_args == spawn.args {
+                return Err(error);
+            }
+            let rewritten_args = args_with_mcp_runtime(&stripped_args, runtime)?;
+            logging::event("tty_restart reason=bad_resume action=strip_resume_args");
+            process.terminate(PTY_TERMINATE_TIMEOUT);
+            *process = spawn_tty_process(
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &rewritten_args,
+                &None,
+                spawn.invocation,
+            )?;
+            prepare_tty_for_prompt_with_mcp(process, input, runtime, sdk_state).await?;
             tail.reset_for_new_session();
             Ok(())
         }
@@ -894,7 +964,8 @@ async fn handle_control_request(
     process: &mut PtyProcess,
     _input: &mut mpsc::Receiver<Value>,
     sdk_state: &mut SdkStreamState,
-    _spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
+    tty_prepared: &mut bool,
     value: &Value,
 ) -> Result<()> {
     let request_id = value
@@ -915,8 +986,30 @@ async fn handle_control_request(
             process.interrupt()?;
             control_success(request_id, Value::Null)
         }
-        "set_model" => control_success(request_id, Value::Null),
-        "set_permission_mode" => control_success(request_id, Value::Null),
+        "set_model" => {
+            if let Some(model) = control_request_string(value, &["model"]) {
+                spawn.args = args_with_option_value(&spawn.args, "--model", &model);
+                restart_tty_after_control_update(process, sdk_state, spawn, tty_prepared)?;
+                logging::event(format!(
+                    "control_update subtype=set_model model={}",
+                    single_line_log_text(&model)
+                ));
+            }
+            control_success(request_id, Value::Null)
+        }
+        "set_permission_mode" => {
+            if let Some(mode) =
+                control_request_string(value, &["mode", "permission_mode", "permissionMode"])
+            {
+                spawn.args = args_with_option_value(&spawn.args, "--permission-mode", &mode);
+                restart_tty_after_control_update(process, sdk_state, spawn, tty_prepared)?;
+                logging::event(format!(
+                    "control_update subtype=set_permission_mode mode={}",
+                    single_line_log_text(&mode)
+                ));
+            }
+            control_success(request_id, Value::Null)
+        }
         "set_max_thinking_tokens" => control_success(request_id, Value::Null),
         "apply_flag_settings" => control_success(request_id, Value::Null),
         "get_context_usage" => {
@@ -934,6 +1027,79 @@ async fn handle_control_request(
     Ok(())
 }
 
+fn control_request_string(value: &Value, keys: &[&str]) -> Option<String> {
+    let request = value.get("request")?;
+    keys.iter().find_map(|key| {
+        request
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn restart_tty_after_control_update(
+    process: &mut PtyProcess,
+    sdk_state: &SdkStreamState,
+    spawn: &StreamSpawnContext<'_>,
+    tty_prepared: &mut bool,
+) -> Result<()> {
+    let args = args_with_runtime_mcp(&spawn.args, sdk_state.mcp_runtime.as_ref())?;
+    logging::event(format!(
+        "tty_restart reason=control_update args={}",
+        sanitized_arg_shape(&args)
+    ));
+    process.terminate(PTY_TERMINATE_TIMEOUT);
+    *process = spawn_tty_process(
+        spawn.claude,
+        spawn.cwd,
+        spawn.env,
+        &args,
+        &spawn.session_id,
+        spawn.invocation,
+    )?;
+    *tty_prepared = false;
+    Ok(())
+}
+
+fn args_with_runtime_mcp(args: &[String], runtime: Option<&SdkMcpRuntime>) -> Result<Vec<String>> {
+    match runtime {
+        Some(runtime) => args_with_mcp_runtime(args, runtime),
+        None => Ok(args.to_vec()),
+    }
+}
+
+fn args_with_option_value(args: &[String], flag: &str, value: &str) -> Vec<String> {
+    let mut updated = Vec::with_capacity(args.len() + 2);
+    let mut index = 0;
+    let mut replaced = false;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == flag {
+            updated.push(arg.clone());
+            updated.push(value.to_owned());
+            replaced = true;
+            index += 1;
+            if index < args.len() && !args[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+        if arg.starts_with(&format!("{flag}=")) {
+            updated.push(format!("{flag}={value}"));
+            replaced = true;
+            index += 1;
+            continue;
+        }
+        updated.push(arg.clone());
+        index += 1;
+    }
+    if !replaced {
+        updated.push(flag.to_owned());
+        updated.push(value.to_owned());
+    }
+    updated
+}
+
 fn sdk_initialize_response() -> Value {
     json!({
         "commands": [],
@@ -943,11 +1109,45 @@ fn sdk_initialize_response() -> Value {
         "models": [
             {
                 "value": "default",
-                "displayName": "Default",
+                "displayName": "Default (recommended)",
                 "description": "Claude Code default model through cctty",
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "medium", "high", "max"],
+                "supportsAdaptiveThinking": true,
+                "supportsAutoMode": true,
+            },
+            {
+                "value": "sonnet[1m]",
+                "displayName": "Sonnet (1M context)",
+                "description": "Claude Code Sonnet 1M context alias through cctty",
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "medium", "high", "max"],
+                "supportsAdaptiveThinking": true,
+                "supportsAutoMode": true,
+            },
+            {
+                "value": "opus",
+                "displayName": "Opus",
+                "description": "Claude Code Opus alias through cctty",
                 "supportsEffort": true,
                 "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
                 "supportsAdaptiveThinking": true,
+                "supportsFastMode": true,
+                "supportsAutoMode": true,
+            },
+            {
+                "value": "haiku",
+                "displayName": "Haiku",
+                "description": "Claude Code Haiku alias through cctty",
+            },
+            {
+                "value": "claude-opus-4-8",
+                "displayName": "Opus 4.8",
+                "description": "Claude Code Opus 4.8 model through cctty",
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                "supportsAdaptiveThinking": true,
+                "supportsFastMode": true,
                 "supportsAutoMode": true,
             },
         ],
