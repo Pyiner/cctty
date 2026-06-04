@@ -627,6 +627,16 @@ while True:
             after += 1
         buf = buf[after:]
         continue
+    if "STDOUT_ONLY_FAKE_RESULT" in prompt:
+        sys.stdout.write("⏺ I inspected the repo and wrote conductor.json\n")
+        sys.stdout.write("⎿ Wrote 5 lines to conductor.json\n")
+        sys.stdout.write("Context permissions /mcp\n")
+        sys.stdout.flush()
+        after = end + len(b"\x1b[201~")
+        while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
+            after += 1
+        buf = buf[after:]
+        continue
     with transcript.open("a", encoding="utf-8") as f:
         f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
         f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")

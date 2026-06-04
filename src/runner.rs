@@ -48,6 +48,7 @@ const MCP_PROXY_REQUEST_LINE_TIMEOUT: Duration = Duration::from_millis(250);
 const PTY_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const TTY_SESSION_LOCK_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_SESSION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(300);
+const TTY_VISIBLE_COMPLETION_IDLE: Duration = Duration::from_secs(3);
 const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 pub async fn run(invocation: Invocation) -> Result<i32> {
@@ -1108,6 +1109,7 @@ async fn tail_until_complete(
     let mut tty_debug = TtyDebugLogger::new("text");
     let mut tail_progress = TailProgressLogger::new("text");
     let mut questions = TtyQuestionBridge::new(false);
+    let mut visible_progress = TtyVisibleProgress::new(process);
 
     loop {
         if started.elapsed() > RUN_TIMEOUT {
@@ -1156,10 +1158,25 @@ async fn tail_until_complete(
         {
             last_activity = Instant::now();
         }
+        visible_progress.observe(process);
         if !state.assistant_text.is_empty() && last_activity.elapsed() >= COMPLETION_IDLE {
             if output_format == OutputFormat::StreamJson && !state.saw_result {
                 let value = synthetic_result(&state, started.elapsed());
                 logging::event("tail_result source=synthetic");
+                println!("{}", serde_json::to_string(&value)?);
+                std::io::stdout().flush()?;
+                state.apply(&value);
+            }
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
+            return Ok(state);
+        }
+        if state.assistant_text.is_empty()
+            && visible_progress.completed_without_transcript(process)
+            && last_activity.elapsed() >= COMPLETION_IDLE
+        {
+            if output_format == OutputFormat::StreamJson && !state.saw_result {
+                let value = synthetic_prompt_ready_result(&state, started.elapsed());
+                logging::event("tail_result source=synthetic_prompt_ready");
                 println!("{}", serde_json::to_string(&value)?);
                 std::io::stdout().flush()?;
                 state.apply(&value);
@@ -1189,6 +1206,7 @@ async fn tail_until_complete_stream(
     let mut questions = TtyQuestionBridge::new(permission_prompt_tool_stdio);
     let mut tty_debug = TtyDebugLogger::new("stream");
     let mut tail_progress = TailProgressLogger::new("stream");
+    let mut visible_progress = TtyVisibleProgress::new(process);
 
     loop {
         if started.elapsed() > RUN_TIMEOUT {
@@ -1243,6 +1261,7 @@ async fn tail_until_complete_stream(
             permission.mark_ask_user_question_handled();
             last_activity = Instant::now();
         }
+        visible_progress.observe(process);
 
         if state.saw_result {
             logging::event("tail_result source=transcript stream=true");
@@ -1264,6 +1283,21 @@ async fn tail_until_complete_stream(
             if output_format == OutputFormat::StreamJson && !state.saw_result {
                 let value = synthetic_result(&state, started.elapsed());
                 logging::event("tail_result source=synthetic stream=true");
+                println!("{}", serde_json::to_string(&value)?);
+                std::io::stdout().flush()?;
+                state.apply(&value);
+            }
+            emit_idle_session_state_if_requested(&mut state, output_format)?;
+            return Ok(state);
+        }
+        if state.assistant_text.is_empty()
+            && !permission.denied_current_turn()
+            && visible_progress.completed_without_transcript(process)
+            && last_activity.elapsed() >= COMPLETION_IDLE
+        {
+            if output_format == OutputFormat::StreamJson && !state.saw_result {
+                let value = synthetic_prompt_ready_result(&state, started.elapsed());
+                logging::event("tail_result source=synthetic_prompt_ready stream=true");
                 println!("{}", serde_json::to_string(&value)?);
                 std::io::stdout().flush()?;
                 state.apply(&value);
@@ -1493,6 +1527,39 @@ impl TailProgressLogger {
             state.saw_result,
             tty_wait_class(&process.recent_output()),
         ));
+    }
+}
+
+struct TtyVisibleProgress {
+    last_snapshot: String,
+    last_change: Instant,
+    saw_model_activity: bool,
+}
+
+impl TtyVisibleProgress {
+    fn new(process: &PtyProcess) -> Self {
+        Self {
+            last_snapshot: tty_progress_snapshot(process),
+            last_change: Instant::now(),
+            saw_model_activity: false,
+        }
+    }
+
+    fn observe(&mut self, process: &PtyProcess) {
+        let snapshot = tty_progress_snapshot(process);
+        if snapshot != self.last_snapshot {
+            self.last_snapshot = snapshot;
+            self.last_change = Instant::now();
+        }
+        if tty_output_has_visible_model_activity(&process.recent_output()) {
+            self.saw_model_activity = true;
+        }
+    }
+
+    fn completed_without_transcript(&self, process: &PtyProcess) -> bool {
+        self.saw_model_activity
+            && tty_wait_class(&process.recent_output()) == "prompt_ready"
+            && self.last_change.elapsed() >= TTY_VISIBLE_COMPLETION_IDLE
     }
 }
 
@@ -3428,6 +3495,29 @@ fn tty_wait_class(output: &str) -> &'static str {
     "other"
 }
 
+fn tty_progress_snapshot(process: &PtyProcess) -> String {
+    compact_tty_output(&plain_tty_output(&process.recent_output()))
+}
+
+fn tty_output_has_visible_model_activity(output: &str) -> bool {
+    let output = plain_tty_output(output);
+    let compact = compact_tty_output(&output);
+    output.contains("⏺")
+        || output.contains("⎿")
+        || output.contains("Bash (")
+        || output.contains("Fetch (")
+        || output.contains("Edit (")
+        || output.contains("Write (")
+        || output.contains("Read (")
+        || output.contains("Wrote ")
+        || output.contains("thinking with")
+        || output.contains("thought for")
+        || output.contains("running stop hook")
+        || compact.contains("thinkingwith")
+        || compact.contains("thoughtfor")
+        || compact.contains("runningstophook")
+}
+
 fn tty_plan_approval_prompt_has_feedback_choice(output: &str) -> bool {
     let output = plain_tty_output(output);
     let compact = compact_tty_output(&output);
@@ -3503,6 +3593,26 @@ fn synthetic_result(state: &TranscriptState, duration: Duration) -> Value {
         "modelUsage": {},
         "permission_denials": [],
         "terminal_reason": "completed",
+        "fast_mode_state": "off",
+    })
+}
+
+fn synthetic_prompt_ready_result(state: &TranscriptState, duration: Duration) -> Value {
+    json!({
+        "type": "result",
+        "subtype": "success",
+        "duration_ms": duration.as_millis() as i64,
+        "duration_api_ms": 0,
+        "is_error": false,
+        "num_turns": 1,
+        "session_id": state.session_id.clone().unwrap_or_default(),
+        "result": "Claude returned to the terminal prompt without writing a transcript result.",
+        "stop_reason": "end_turn",
+        "usage": zero_usage(),
+        "total_cost_usd": 0.0,
+        "modelUsage": {},
+        "permission_denials": [],
+        "terminal_reason": "prompt_ready_without_transcript",
         "fast_mode_state": "off",
     })
 }

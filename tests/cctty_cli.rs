@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
@@ -1628,6 +1628,80 @@ fn stream_json_synthetic_result_emits_idle_and_accepts_followup() {
             panic!("cctty did not exit after stdin closed");
         });
     assert!(status.success());
+}
+
+#[test]
+fn stream_json_synthesizes_result_when_tty_finishes_without_transcript() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000024";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"STDOUT_ONLY_FAKE_RESULT"}}}}"#
+    )
+    .unwrap();
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not synthesize a prompt-ready result");
+        });
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+
+    assert!(status.success(), "stderr:\n{stderr}");
+    let values = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let result = values
+        .iter()
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("result"))
+        .expect("expected synthetic result");
+    assert_eq!(result["terminal_reason"], "prompt_ready_without_transcript");
+    assert!(
+        values.iter().any(|value| {
+            value["type"] == "system"
+                && value["subtype"] == "session_state_changed"
+                && value["state"] == "idle"
+        }),
+        "stdout:\n{stdout}"
+    );
 }
 
 #[test]
