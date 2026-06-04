@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader as StdBufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -534,6 +535,7 @@ async fn run_stream_json(
                     "stream_user received content_chars={}",
                     prompt.chars().count()
                 ));
+                maybe_log_prompt_diagnostic(&prompt);
                 if ensure_sdk_mcp_runtime(process, tail, &mut input, &mut sdk_state, spawn).await? {
                     tty_prepared = true;
                 }
@@ -1057,12 +1059,41 @@ async fn submit_prompt_to_tty(process: &mut PtyProcess, prompt: &str) -> Result<
     ));
     process.write_all(&bracketed_paste_input(prompt))?;
     tokio::time::sleep(Duration::from_millis(120)).await;
+    maybe_log_submit_tty_diagnostic(process, "after_paste");
     if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
         logging::event("prompt_submit_retry reason=prompt_still_visible");
         process.write_all(b"\r")?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        maybe_log_submit_tty_diagnostic(process, "after_retry_enter");
     }
     logging::event("prompt_submit done");
     Ok(())
+}
+
+fn maybe_log_prompt_diagnostic(prompt: &str) {
+    if std::env::var("CCTTY_LOG_PROMPT").ok().as_deref() != Some("1") {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    logging::event(format!(
+        "prompt_debug chars={} hash={:016x} preview={}",
+        prompt.chars().count(),
+        hasher.finish(),
+        single_line_log_text(&recent_tty_log_text(prompt, 1_000))
+    ));
+}
+
+fn maybe_log_submit_tty_diagnostic(process: &PtyProcess, stage: &str) {
+    if std::env::var("CCTTY_LOG_TTY").ok().as_deref() != Some("1") {
+        return;
+    }
+    logging::event(format!(
+        "prompt_submit_tty stage={} tty={} text={}",
+        stage,
+        tty_wait_class(&process.recent_output()),
+        single_line_log_text(&recent_tty_log_text(&process.recent_output(), 1_500))
+    ));
 }
 
 async fn tail_until_complete(
@@ -1075,6 +1106,7 @@ async fn tail_until_complete(
     let mut last_activity = Instant::now();
     let mut state = TranscriptState::default();
     let mut tty_debug = TtyDebugLogger::new("text");
+    let mut tail_progress = TailProgressLogger::new("text");
     let mut questions = TtyQuestionBridge::new(false);
 
     loop {
@@ -1135,6 +1167,7 @@ async fn tail_until_complete(
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
+        tail_progress.maybe_log(process, tail, &state, started.elapsed());
         tty_debug.maybe_log(process, started.elapsed());
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
@@ -1155,6 +1188,7 @@ async fn tail_until_complete_stream(
     let mut permission = PermissionBridge::new(permission_prompt_tool_stdio);
     let mut questions = TtyQuestionBridge::new(permission_prompt_tool_stdio);
     let mut tty_debug = TtyDebugLogger::new("stream");
+    let mut tail_progress = TailProgressLogger::new("stream");
 
     loop {
         if started.elapsed() > RUN_TIMEOUT {
@@ -1237,6 +1271,7 @@ async fn tail_until_complete_stream(
             emit_idle_session_state_if_requested(&mut state, output_format)?;
             return Ok(state);
         }
+        tail_progress.maybe_log(process, tail, &state, started.elapsed());
         tty_debug.maybe_log(process, started.elapsed());
         tokio::time::sleep(TRANSCRIPT_POLL).await;
     }
@@ -1420,6 +1455,43 @@ impl TtyDebugLogger {
             self.stage,
             elapsed.as_millis(),
             single_line_log_text(&recent)
+        ));
+    }
+}
+
+struct TailProgressLogger {
+    stage: &'static str,
+    next_log: Instant,
+}
+
+impl TailProgressLogger {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            next_log: Instant::now() + Duration::from_secs(10),
+        }
+    }
+
+    fn maybe_log(
+        &mut self,
+        process: &PtyProcess,
+        tail: &TailCursor,
+        state: &TranscriptState,
+        elapsed: Duration,
+    ) {
+        if Instant::now() < self.next_log {
+            return;
+        }
+        self.next_log = Instant::now() + Duration::from_secs(10);
+        logging::event(format!(
+            "tail_wait stage={} elapsed_ms={} transcript={} offset={} assistant_chars={} saw_result={} tty={}",
+            self.stage,
+            elapsed.as_millis(),
+            tail.path_log_label(),
+            tail.offset,
+            state.assistant_text.chars().count(),
+            state.saw_result,
+            tty_wait_class(&process.recent_output()),
         ));
     }
 }
@@ -3323,6 +3395,39 @@ fn tty_output_has_plan_approval_prompt(output: &str) -> bool {
     has_plan_language && has_question && has_allow_choice && has_deny_choice
 }
 
+fn tty_wait_class(output: &str) -> &'static str {
+    let plain = plain_tty_output(output);
+    let compact = compact_tty_output(&plain);
+    if compact.is_empty() {
+        return "empty";
+    }
+    if tty_output_has_plan_approval_prompt(output) {
+        return "plan_approval";
+    }
+    if tty_question_from_form(&plain).is_some() {
+        return "question_form";
+    }
+    if plain_tty_output_has_file_permission_prompt(&plain)
+        || plain_tty_output_has_permission_prompt_for_tool(&plain, "Bash")
+        || plain_tty_output_has_generic_permission_prompt(&plain)
+    {
+        return "permission_prompt";
+    }
+    if compact.contains("RemoteControlfailed") {
+        return "remote_control_failed";
+    }
+    if compact.contains("RemoteControlactive") {
+        return "remote_control_active";
+    }
+    if tty_output_accepts_prompt(output) {
+        return "prompt_ready";
+    }
+    if compact.contains("Esc") && compact.contains("interrupt") {
+        return "busy";
+    }
+    "other"
+}
+
 fn tty_plan_approval_prompt_has_feedback_choice(output: &str) -> bool {
     let output = plain_tty_output(output);
     let compact = compact_tty_output(&output);
@@ -3692,6 +3797,9 @@ fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
     {
         return false;
     }
+    if tty_output_has_collapsed_paste_input(&plain) {
+        return true;
+    }
     let prompt = compact_tty_output(prompt);
     if prompt.is_empty() {
         return false;
@@ -3703,6 +3811,13 @@ fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
         .map(|(index, _)| &prompt[index..])
         .unwrap_or(prompt.as_str());
     compact_tty_output(&plain).contains(tail)
+}
+
+fn tty_output_has_collapsed_paste_input(output: &str) -> bool {
+    let recent = recent_tty_log_text(output, 1_200);
+    let compact = compact_tty_output(&recent);
+    (recent.contains("[Pasted text #") || compact.contains("[Pastedtext#"))
+        && (recent.contains("paste again to expand") || compact.contains("pasteagaintoexpand"))
 }
 
 struct TailCursor {
@@ -3773,6 +3888,15 @@ impl TailCursor {
 
     fn externalize_value(&self, value: &mut Value) {
         self.session_alias.externalize_value(value);
+    }
+
+    fn path_log_label(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or("none")
+            .to_owned()
     }
 
     fn remove_current_transcript(&self) -> Result<()> {
@@ -3860,6 +3984,31 @@ mod tests {
         assert!(tty_output_still_editing_prompt(
             output,
             "Write a compact document for SDK users"
+        ));
+    }
+
+    #[test]
+    fn detects_collapsed_paste_left_in_tty_input() {
+        let output = "\
+            [Opus 4.8] │ workspace git:( test ) Context 0% \
+            ⏸ plan mode on (shift+tab to cycle) · ← for agents \
+            ────── ↯ 1 MCP server failed · /mcp \
+            ❯ B [Pasted text #1 +15 lines] paste again to expand";
+        assert!(tty_output_still_editing_prompt(
+            output,
+            "system instructions\n\nUser prompt"
+        ));
+    }
+
+    #[test]
+    fn ignores_stale_collapsed_paste_from_previous_turn() {
+        let output = format!(
+            "[Pasted text #1 +15 lines] paste again to expand {} ❯",
+            "assistant result ".repeat(200)
+        );
+        assert!(!tty_output_still_editing_prompt(
+            &output,
+            "next user prompt"
         ));
     }
 
