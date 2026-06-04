@@ -54,6 +54,7 @@ if env_path:
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_AGENT_SDK_VERSION",
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK",
+        "CLAUDE_CODE_OAUTH_TOKEN",
     ]
     Path(env_path).write_text(json.dumps({key: os.environ.get(key) for key in keys}), encoding="utf-8")
 

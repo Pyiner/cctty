@@ -223,7 +223,7 @@ fn spawn_tty_process(
         args: args.to_vec(),
         cwd: cwd.to_path_buf(),
         env: env.clone(),
-        unset_env: interactive_claude_unset_env(),
+        unset_env: interactive_claude_unset_env(args),
     })
 }
 
@@ -234,15 +234,42 @@ fn interactive_claude_env() -> HashMap<String, String> {
     ])
 }
 
-fn interactive_claude_unset_env() -> Vec<String> {
-    [
+fn interactive_claude_unset_env(args: &[String]) -> Vec<String> {
+    let mut keys = [
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_AGENT_SDK_VERSION",
         "NO_COLOR",
     ]
     .into_iter()
     .map(ToOwned::to_owned)
-    .collect()
+    .collect::<Vec<_>>();
+    if enables_remote_control(args) {
+        if std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_some() {
+            logging::event(
+                "env_unset reason=remote_control_full_scope name=CLAUDE_CODE_OAUTH_TOKEN",
+            );
+        }
+        keys.push("CLAUDE_CODE_OAUTH_TOKEN".to_owned());
+    }
+    keys
+}
+
+fn enables_remote_control(args: &[String]) -> bool {
+    let mut enabled = false;
+    for arg in args {
+        if arg == "--no-chrome" {
+            enabled = false;
+        } else if matches!(
+            arg.as_str(),
+            "--chrome" | "--remote-control" | "--remote" | "--rc"
+        ) || arg.starts_with("--remote-control=")
+            || arg.starts_with("--remote=")
+            || arg.starts_with("--rc=")
+        {
+            enabled = true;
+        }
+    }
+    enabled
 }
 
 fn is_bad_resume_startup_error(error: &CcttyError) -> bool {

@@ -159,6 +159,7 @@ fn interactive_claude_gets_terminal_env_not_sdk_transport_env() {
         .env("CLAUDE_CODE_ENTRYPOINT", "sdk-py")
         .env("CLAUDE_AGENT_SDK_VERSION", "0.0.0")
         .env("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-setup-token")
         .current_dir(workspace.path())
         .args(["--print", "--output-format", "stream-json", "Say OK"])
         .assert()
@@ -171,6 +172,36 @@ fn interactive_claude_gets_terminal_env_not_sdk_transport_env() {
     assert_eq!(env["NO_COLOR"], Value::Null);
     assert_eq!(env["CLAUDE_CODE_ENTRYPOINT"], Value::Null);
     assert_eq!(env["CLAUDE_AGENT_SDK_VERSION"], Value::Null);
+    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "synthetic-setup-token");
+}
+
+#[test]
+fn remote_control_uses_login_auth_instead_of_inference_only_oauth_env() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let env_path = tempfile::NamedTempFile::new().unwrap();
+
+    Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ENV_PATH", env_path.path())
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-setup-token")
+        .current_dir(workspace.path())
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--chrome",
+            "Say OK",
+        ])
+        .assert()
+        .success();
+
+    let env: Value =
+        serde_json::from_str(&std::fs::read_to_string(env_path.path()).unwrap()).unwrap();
+    assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], Value::Null);
 }
 
 #[test]
