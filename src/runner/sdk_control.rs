@@ -82,7 +82,7 @@ fn control_request_string(value: &Value, keys: &[&str]) -> Option<String> {
 fn restart_tty_after_control_update(
     process: &mut PtyProcess,
     sdk_state: &SdkStreamState,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
     tty_prepared: &mut bool,
 ) -> Result<()> {
     let args = args_with_runtime_mcp(&spawn.args, sdk_state.mcp_runtime.as_ref())?;
@@ -99,6 +99,7 @@ fn restart_tty_after_control_update(
         &spawn.session_id,
         spawn.invocation,
     )?;
+    spawn.allow_session_strip_on_next_prepare = true;
     *tty_prepared = false;
     Ok(())
 }

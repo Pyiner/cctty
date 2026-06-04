@@ -597,6 +597,215 @@ fn stream_json_control_updates_restart_tty_with_new_model_and_permission_mode() 
 }
 
 #[test]
+fn stream_json_control_permission_mode_restart_recovers_from_stale_session_lock() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_lock_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000021";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_DIR", session_lock_dir.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_STALE_MS", "30000")
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "First prompt" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let first_result = wait_for_result_line(&mut reader, &mut line);
+    assert_eq!(first_result["result"], "FAKE_RESPONSE: First prompt");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "plan-after-prompt",
+            "request": { "subtype": "set_permission_mode", "mode": "plan" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let plan_response = read_json_line(&mut reader, &mut line);
+    assert_eq!(plan_response["type"], "control_response");
+    assert_eq!(plan_response["response"]["request_id"], "plan-after-prompt");
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "Second prompt" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let second_result = wait_for_result_line(&mut reader, &mut line);
+    assert_eq!(second_result["result"], "FAKE_RESPONSE: Second prompt");
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--permission-mode" && pair[1] == "plan"),
+        "argv={argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg == "--session-id")
+            && !argv.iter().any(|arg| arg.starts_with("--session-id=")),
+        "session args should be stripped after control-update session lock: {argv:?}"
+    );
+}
+
+#[test]
+fn stream_json_control_permission_mode_restart_recovers_before_sdk_mcp_runtime() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_lock_dir = tempfile::tempdir().unwrap();
+    let argv_path = tempfile::NamedTempFile::new().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000022";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv_path.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_DIR", session_lock_dir.path())
+        .env("FAKE_CLAUDE_SESSION_LOCK_STALE_MS", "30000")
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "init-conductor",
+            "request": { "subtype": "initialize", "sdkMcpServers": ["conductor"], "systemPrompt": [""] },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let init_response = read_json_line(&mut reader, &mut line);
+    assert_eq!(init_response["type"], "control_response");
+    assert_eq!(init_response["response"]["request_id"], "init-conductor");
+    std::thread::sleep(Duration::from_millis(150));
+
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "type": "control_request",
+            "request_id": "plan-before-mcp",
+            "request": { "subtype": "set_permission_mode", "mode": "plan" },
+        })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let plan_response = read_json_line(&mut reader, &mut line);
+    assert_eq!(plan_response["type"], "control_response");
+    assert_eq!(plan_response["response"]["request_id"], "plan-before-mcp");
+    std::fs::write(
+        session_lock_dir.path().join(format!("{session_id}.lock")),
+        "stale-until:4102444800000",
+    )
+    .unwrap();
+
+    let (methods, result) = drive_fake_sdk_mcp_prompt(
+        &mut stdin,
+        &mut reader,
+        &mut line,
+        "USE_FAKE_SDK_MCP_ASK after plan",
+    );
+    assert_eq!(methods, ["initialize", "tools/list", "tools/call"]);
+    assert!(result.contains("Technical design"), "{result}");
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
+
+    let argv: Vec<String> =
+        serde_json::from_str(&std::fs::read_to_string(argv_path.path()).unwrap()).unwrap();
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--permission-mode" && pair[1] == "plan"),
+        "argv={argv:?}"
+    );
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair[0] == "--mcp-config" && pair[1].contains("__cctty-mcp-proxy")),
+        "argv={argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|arg| arg == "--session-id")
+            && !argv.iter().any(|arg| arg.starts_with("--session-id=")),
+        "session args should be stripped after control-update SDK MCP session lock: {argv:?}"
+    );
+}
+
+#[test]
 fn stream_json_metadata_control_requests_do_not_wait_for_tty_prompt() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -813,6 +1022,15 @@ fn read_json_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value {
     let count = reader.read_line(line).unwrap();
     assert!(count > 0, "expected JSON line from cctty");
     serde_json::from_str(line.trim()).unwrap()
+}
+
+fn wait_for_result_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value {
+    loop {
+        let value = read_json_line(reader, line);
+        if value.get("type").and_then(Value::as_str) == Some("result") {
+            return value;
+        }
+    }
 }
 
 fn drive_fake_sdk_mcp_prompt<W: Write, R: BufRead>(

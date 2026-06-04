@@ -179,6 +179,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
                 args: passthrough_args.clone(),
                 session_id: current_session_id.clone(),
                 invocation: &invocation,
+                allow_session_strip_on_next_prepare: false,
             };
             run_stream_json(
                 &mut process,
@@ -392,13 +393,15 @@ struct StreamSpawnContext<'a> {
     args: Vec<String>,
     session_id: Option<String>,
     invocation: &'a Invocation,
+    allow_session_strip_on_next_prepare: bool,
 }
 
 async fn ensure_sdk_mcp_runtime(
     process: &mut PtyProcess,
+    tail: &mut TailCursor,
     input: &mut mpsc::Receiver<Value>,
     sdk_state: &mut SdkStreamState,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
 ) -> Result<bool> {
     if sdk_state.mcp_runtime.is_some() {
         return Ok(false);
@@ -429,7 +432,7 @@ async fn ensure_sdk_mcp_runtime(
         &spawn.session_id,
         spawn.invocation,
     )?;
-    prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+    match prepare_tty_for_prompt_with_mcp_retrying_session_lock(
         process,
         input,
         &runtime,
@@ -438,7 +441,49 @@ async fn ensure_sdk_mcp_runtime(
         &rewritten_args,
         &spawn.session_id,
     )
-    .await?;
+    .await
+    {
+        Ok(()) => {
+            spawn.allow_session_strip_on_next_prepare = false;
+        }
+        Err(error)
+            if is_session_lock_startup_error(&error)
+                && spawn.allow_session_strip_on_next_prepare =>
+        {
+            let stripped_args = strip_session_resume_args(&spawn.args);
+            if stripped_args == spawn.args {
+                return Err(error);
+            }
+            let rewritten_stripped_args = args_with_mcp_runtime(&stripped_args, &runtime)?;
+            logging::event(
+                "tty_restart reason=control_update_session_lock action=strip_session_args",
+            );
+            process.terminate(PTY_TERMINATE_TIMEOUT);
+            *process = spawn_tty_process(
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &rewritten_stripped_args,
+                &None,
+                spawn.invocation,
+            )?;
+            prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+                process,
+                input,
+                &runtime,
+                sdk_state,
+                spawn,
+                &rewritten_stripped_args,
+                &None,
+            )
+            .await?;
+            spawn.args = stripped_args;
+            spawn.session_id = None;
+            spawn.allow_session_strip_on_next_prepare = false;
+            tail.reset_for_new_session();
+        }
+        Err(error) => return Err(error),
+    }
     sdk_state.mcp_runtime = Some(runtime);
     Ok(true)
 }
@@ -483,7 +528,7 @@ async fn run_stream_json(
             Some("control_response") => {}
             Some("control_cancel_request") => {}
             Some("user") => {
-                if ensure_sdk_mcp_runtime(process, &mut input, &mut sdk_state, spawn).await? {
+                if ensure_sdk_mcp_runtime(process, tail, &mut input, &mut sdk_state, spawn).await? {
                     tty_prepared = true;
                 }
                 if !tty_prepared {
@@ -521,7 +566,7 @@ async fn prepare_stream_tty_for_prompt_with_sdk_state(
     tail: &mut TailCursor,
     input: &mut mpsc::Receiver<Value>,
     sdk_state: &mut SdkStreamState,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
 ) -> Result<()> {
     let Some(runtime) = sdk_state.mcp_runtime.take() else {
         return prepare_stream_tty_for_prompt(process, tail, spawn).await;
@@ -537,7 +582,7 @@ async fn prepare_stream_tty_for_prompt_with_sdk_state(
 async fn prepare_stream_tty_for_prompt(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
 ) -> Result<()> {
     match prepare_tty_for_prompt_retrying_session_lock(
         process,
@@ -550,7 +595,46 @@ async fn prepare_stream_tty_for_prompt(
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            spawn.allow_session_strip_on_next_prepare = false;
+            Ok(())
+        }
+        Err(error)
+            if is_session_lock_startup_error(&error)
+                && spawn.allow_session_strip_on_next_prepare =>
+        {
+            let stripped_args = strip_session_resume_args(&spawn.args);
+            if stripped_args == spawn.args {
+                return Err(error);
+            }
+            logging::event(
+                "tty_restart reason=control_update_session_lock action=strip_session_args",
+            );
+            process.terminate(PTY_TERMINATE_TIMEOUT);
+            *process = spawn_tty_process(
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &stripped_args,
+                &None,
+                spawn.invocation,
+            )?;
+            prepare_tty_for_prompt_retrying_session_lock(
+                process,
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &stripped_args,
+                &None,
+                spawn.invocation,
+            )
+            .await?;
+            spawn.args = stripped_args;
+            spawn.session_id = None;
+            spawn.allow_session_strip_on_next_prepare = false;
+            tail.reset_for_new_session();
+            Ok(())
+        }
         Err(error) if is_bad_resume_startup_error(&error) => {
             let stripped_args = strip_session_resume_args(&spawn.args);
             if stripped_args == spawn.args {
@@ -576,6 +660,9 @@ async fn prepare_stream_tty_for_prompt(
                 spawn.invocation,
             )
             .await?;
+            spawn.args = stripped_args;
+            spawn.session_id = None;
+            spawn.allow_session_strip_on_next_prepare = false;
             tail.reset_for_new_session();
             Ok(())
         }
@@ -589,7 +676,7 @@ async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
     input: &mut mpsc::Receiver<Value>,
     runtime: &SdkMcpRuntime,
     sdk_state: &mut SdkStreamState,
-    spawn: &StreamSpawnContext<'_>,
+    spawn: &mut StreamSpawnContext<'_>,
 ) -> Result<()> {
     let rewritten_spawn_args = args_with_mcp_runtime(&spawn.args, runtime)?;
     match prepare_tty_for_prompt_with_mcp_retrying_session_lock(
@@ -603,7 +690,47 @@ async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            spawn.allow_session_strip_on_next_prepare = false;
+            Ok(())
+        }
+        Err(error)
+            if is_session_lock_startup_error(&error)
+                && spawn.allow_session_strip_on_next_prepare =>
+        {
+            let stripped_args = strip_session_resume_args(&spawn.args);
+            if stripped_args == spawn.args {
+                return Err(error);
+            }
+            let rewritten_args = args_with_mcp_runtime(&stripped_args, runtime)?;
+            logging::event(
+                "tty_restart reason=control_update_session_lock action=strip_session_args",
+            );
+            process.terminate(PTY_TERMINATE_TIMEOUT);
+            *process = spawn_tty_process(
+                spawn.claude,
+                spawn.cwd,
+                spawn.env,
+                &rewritten_args,
+                &None,
+                spawn.invocation,
+            )?;
+            prepare_tty_for_prompt_with_mcp_retrying_session_lock(
+                process,
+                input,
+                runtime,
+                sdk_state,
+                spawn,
+                &rewritten_args,
+                &None,
+            )
+            .await?;
+            spawn.args = stripped_args;
+            spawn.session_id = None;
+            spawn.allow_session_strip_on_next_prepare = false;
+            tail.reset_for_new_session();
+            Ok(())
+        }
         Err(error) if is_bad_resume_startup_error(&error) => {
             let stripped_args = strip_session_resume_args(&spawn.args);
             if stripped_args == spawn.args {
@@ -630,6 +757,9 @@ async fn prepare_stream_tty_for_prompt_with_mcp_runtime(
                 &None,
             )
             .await?;
+            spawn.args = stripped_args;
+            spawn.session_id = None;
+            spawn.allow_session_strip_on_next_prepare = false;
             tail.reset_for_new_session();
             Ok(())
         }
