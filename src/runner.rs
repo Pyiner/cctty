@@ -43,6 +43,7 @@ const PERMISSION_PROMPT_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_PERMISSION_TRANSCRIPT_GRACE: Duration = Duration::from_millis(1_500);
 const TTY_QUESTION_FORM_SETTLE: Duration = Duration::from_millis(250);
 const MCP_PROXY_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MCP_PROXY_REQUEST_LINE_TIMEOUT: Duration = Duration::from_millis(250);
 const PTY_TERMINATE_TIMEOUT: Duration = Duration::from_secs(5);
 const TTY_SESSION_LOCK_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 const TTY_SESSION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(300);
@@ -901,10 +902,23 @@ async fn service_pending_mcp_proxy_requests_for_runtime(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(error) => return Err(error.into()),
         };
+        stream.set_read_timeout(Some(MCP_PROXY_REQUEST_LINE_TIMEOUT))?;
         let mut line = String::new();
         {
             let mut reader = StdBufReader::new(stream.try_clone()?);
-            reader.read_line(&mut line)?;
+            match reader.read_line(&mut line) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    logging::event("mcp_proxy_skip reason=request_line_timeout");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         if line.trim().is_empty() {
             continue;
@@ -1037,12 +1051,17 @@ async fn submit_prompt_and_tail_stream(
 }
 
 async fn submit_prompt_to_tty(process: &mut PtyProcess, prompt: &str) -> Result<()> {
+    logging::event(format!(
+        "prompt_submit start content_chars={}",
+        prompt.chars().count()
+    ));
     process.write_all(&bracketed_paste_input(prompt))?;
     tokio::time::sleep(Duration::from_millis(120)).await;
     if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
         logging::event("prompt_submit_retry reason=prompt_still_visible");
         process.write_all(b"\r")?;
     }
+    logging::event("prompt_submit done");
     Ok(())
 }
 
@@ -3517,6 +3536,10 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
         }
         if tty_output_accepts_prompt(&output) {
             tokio::time::sleep(TTY_READY_SETTLE).await;
+            logging::event(format!(
+                "tty_ready stage=prepare elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
             return Ok(());
         }
         if started.elapsed() > TTY_STARTUP_TIMEOUT {
@@ -3576,7 +3599,10 @@ async fn prepare_tty_for_prompt_with_mcp(
         }
         if tty_output_accepts_prompt(&output) {
             tokio::time::sleep(TTY_READY_SETTLE).await;
-            service_pending_mcp_proxy_requests_for_runtime(input, runtime, sdk_state).await?;
+            logging::event(format!(
+                "tty_ready stage=prepare_mcp elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
             return Ok(());
         }
         if started.elapsed() > TTY_STARTUP_TIMEOUT {
@@ -4298,6 +4324,24 @@ mod tests {
             Remote Control active ────── ↯ Remote Control active";
 
         assert!(tty_output_accepts_prompt(output));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sdk_mcp_proxy_connection_without_line_does_not_block_prepare_loop() {
+        use std::os::unix::net::UnixStream;
+
+        let runtime = create_sdk_mcp_runtime(vec!["conductor".to_owned()]).unwrap();
+        let _held_open = UnixStream::connect(&runtime.socket_path).unwrap();
+        let (_tx, mut rx) = mpsc::channel(1);
+        let mut sdk_state = SdkStreamState::new(&[]);
+        let started = Instant::now();
+
+        service_pending_mcp_proxy_requests_for_runtime(&mut rx, &runtime, &mut sdk_state)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
