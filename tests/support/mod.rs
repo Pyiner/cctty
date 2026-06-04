@@ -222,7 +222,10 @@ startup_delay_ms = os.environ.get("FAKE_CLAUDE_STARTUP_DELAY_MS")
 if startup_delay_ms:
     time.sleep(int(startup_delay_ms) / 1000)
 
-sys.stdout.write("Context permissions /mcp\n")
+ready_output = os.environ.get("FAKE_CLAUDE_READY_OUTPUT", "Context permissions /mcp\n")
+sys.stdout.write(ready_output)
+if ready_output and not ready_output.endswith("\n"):
+    sys.stdout.write("\n")
 sys.stdout.flush()
 
 buf = b""

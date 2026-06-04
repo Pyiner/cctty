@@ -92,6 +92,54 @@ fn stream_json_text_prompt_uses_tty_transcript() {
 }
 
 #[test]
+fn stream_json_remote_control_active_screen_accepts_prompt() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let ready_output = "\
+        ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents ◉ xhigh · /effort \
+        Remote Control connecting… ⚠ 1 setup issue: MCP · /doctor ↯ /fast \
+        ❯ Try \"edit main.go to...\" \
+        [Opus 4.8] │ workspace git:( test/remote-control ) Context ░░░░░░░░░░ 0% \
+        ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents \
+        Remote Control active ────── ↯ Remote Control active";
+    let stdin = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "Remote control prompt" },
+        })
+    );
+
+    let output = Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_READY_OUTPUT", ready_output)
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+        ])
+        .write_stdin(stdin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("FAKE_RESPONSE: Remote control prompt"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn stream_json_accepts_non_uuid_host_session_id() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();

@@ -528,6 +528,11 @@ async fn run_stream_json(
             Some("control_response") => {}
             Some("control_cancel_request") => {}
             Some("user") => {
+                let prompt = user_prompt_from_sdk_message(&value)?;
+                logging::event(format!(
+                    "stream_user received content_chars={}",
+                    prompt.chars().count()
+                ));
                 if ensure_sdk_mcp_runtime(process, tail, &mut input, &mut sdk_state, spawn).await? {
                     tty_prepared = true;
                 }
@@ -542,7 +547,6 @@ async fn run_stream_json(
                     .await?;
                     tty_prepared = true;
                 }
-                let prompt = user_prompt_from_sdk_message(&value)?;
                 let _ = submit_prompt_and_tail_stream(
                     process,
                     tail,
@@ -3637,10 +3641,12 @@ fn tty_output_accepts_prompt(output: &str) -> bool {
     let compact = compact_tty_output(&output);
     let has_status = output.contains("permissions")
         || output.contains("Remote Control failed")
+        || output.contains("Remote Control active")
         || output.contains("MCP server failed")
         || output.contains("/mcp")
         || compact.contains("permissions")
         || compact.contains("RemoteControlfailed")
+        || compact.contains("RemoteControlactive")
         || compact.contains("MCPserverfailed")
         || compact.contains("/mcp");
     let has_prompt_marker = output.contains('❯') || compact.contains('❯');
@@ -4279,6 +4285,19 @@ mod tests {
         assert_eq!(question.options[0].description, "技术设计文档风格");
         assert_eq!(question.options[1].label, "操作手册");
         assert_eq!(question.options[1].description, "操作手册文档风格");
+    }
+
+    #[test]
+    fn accepts_remote_control_active_screen_as_prompt_ready() {
+        let output = "\
+            ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents ◉ xhigh · /effort \
+            Remote Control connecting… ⚠ 1 setup issue: MCP · /doctor ↯ /fast \
+            ❯ Try \"edit main.go to...\" \
+            [Opus 4.8] │ workspace git:( test/remote-control ) Context ░░░░░░░░░░ 0% \
+            ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents \
+            Remote Control active ────── ↯ Remote Control active";
+
+        assert!(tty_output_accepts_prompt(output));
     }
 
     #[test]
