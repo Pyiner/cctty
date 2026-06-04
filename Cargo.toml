@@ -1,8 +1,8 @@
 [package]
 name = "cctty"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Drop-in Claude Agent SDK runner backed by the interactive Claude TTY"
+description = "Claude Agent SDK compatibility through the interactive Claude Code TTY"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Pyiner/cctty"

@@ -1,105 +1,83 @@
-# cctty
+<p align="center">
+  <img src="assets/cctty-banner.svg" alt="cctty: Claude Agent SDK through the real terminal" width="100%">
+</p>
 
-**Use Claude Code through a real terminal while keeping the official Python and
-TypeScript Claude Agent SDKs.**
+<h1 align="center">cctty</h1>
 
-`cctty` is a drop-in `claude` executable replacement for Claude Agent SDK apps.
-It launches the interactive Claude Code CLI inside a real PTY, drives the
-terminal the way a person would, and translates the session back into
-SDK-compatible `stream-json` messages.
+<p align="center">
+  <strong>Run Claude Agent SDK apps through the same interactive Claude Code terminal humans use.</strong>
+</p>
 
-If the non-interactive Claude Code or Claude Agent SDK execution path becomes
-separately billed, unavailable, restricted, too expensive, or behaviorally
-different from the terminal experience, `cctty` gives you a practical fallback:
-keep the official Python or TypeScript SDK, but run the actual Claude Code work
-through the interactive terminal.
+<p align="center">
+  <a href="README.zh-CN.md">中文文档</a>
+  ·
+  <a href="#quick-start">Quick start</a>
+  ·
+  <a href="#tested-open-source-integrations">Integrations</a>
+  ·
+  <a href="#compatibility-matrix">Compatibility matrix</a>
+</p>
 
-In other words: **Claude Code SDK compatibility, powered by the interactive
-Claude Code terminal.**
+<p align="center">
+  <a href="https://github.com/Pyiner/cctty/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Pyiner/cctty/ci.yml?branch=master&label=ci&style=for-the-badge"></a>
+  <a href="https://github.com/Pyiner/cctty/releases"><img alt="Release" src="https://img.shields.io/github/v/release/Pyiner/cctty?style=for-the-badge"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-57b500?style=for-the-badge"></a>
+  <a href="https://github.com/Pyiner/homebrew-cctty"><img alt="Homebrew" src="https://img.shields.io/badge/homebrew-Pyiner%2Fcctty-fbb040?style=for-the-badge"></a>
+</p>
 
-## Why cctty?
+`cctty` is a drop-in `claude` executable replacement for the official Claude
+Agent SDKs. Your app keeps using the Python or TypeScript SDK. `cctty` replaces
+only the executable path, launches interactive Claude Code inside a real PTY,
+drives it like a person would, and translates the terminal session back into
+SDK-compatible `stream-json`.
 
-Claude Code has two very different surfaces:
+If non-interactive Claude Code or Claude Agent SDK execution is separately
+billed, restricted, unavailable, or behaviorally different from the terminal
+experience, `cctty` gives you the escape hatch:
 
-- the terminal UI that humans use interactively;
-- the non-interactive SDK/`stream-json` path that agent applications launch.
-
-`cctty` bridges those surfaces. It starts interactive Claude Code in a TTY,
-submits prompts with bracketed paste, watches Claude's transcript, handles
-keyboard-driven permission forms, and emits the messages that the official SDKs
-expect.
-
-Use `cctty` when you want:
-
-- **A practical answer to separate Claude Agent SDK billing.** Keep the SDK
-  integration surface, but execute the work through interactive Claude Code in a
-  terminal session.
-- **A Claude Code SDK alternative without leaving the official SDKs.** Keep
-  using `claude-agent-sdk` for Python or `@anthropic-ai/claude-agent-sdk` for
-  TypeScript. `cctty` replaces only the executable path.
-- **Terminal-native Claude Code behavior.** The work is done by the interactive
-  `claude` CLI inside a PTY, not by reimplementing Claude Code.
-- **Permission callbacks that still work.** SDK `can_use_tool` approvals are
-  bridged to Claude's keyboard-driven TTY permission forms for Bash and file
-  writes.
-- **A testable compatibility contract.** Every captured `claude --help` flag is
-  listed below with support status, known gaps, and test coverage.
-- **A real SDK smoke test path.** The live suite asks both Python and
-  TypeScript SDKs to build a browser mini-game under `permissionMode: "default"`
-  and verifies the files are created through SDK approvals.
-
-## Drop-in SDK Replacement
-
-For most SDK apps, only one thing changes: the Claude executable path.
-
-One executable path:
-
-```diff
-- cli_path="/path/to/claude"
-+ cli_path="/path/to/cctty"
-```
-
-or, in TypeScript:
-
-```diff
-- pathToClaudeCodeExecutable: "/path/to/claude"
-+ pathToClaudeCodeExecutable: "/path/to/cctty"
-```
-
-Everything else stays on the official SDK: streaming messages, permission
-callbacks, `permissionMode`, `maxTurns`, `model`, `settingSources`, and the rest
-of the SDK surface continue to flow through the SDK you already use.
+> **keep the official SDK API; run the actual work through interactive Claude
+> Code.**
 
 `cctty` is not affiliated with Anthropic. It still requires a locally installed
 and authenticated Claude Code CLI.
+
+## What You Get
+
+| Capability | Status |
+| --- | --- |
+| Official TypeScript SDK | Supported via `pathToClaudeCodeExecutable: "cctty"`. |
+| Official Python SDK | Supported via `ClaudeAgentOptions(cli_path="cctty")`. |
+| Permissions | SDK `can_use_tool` callbacks are bridged to Claude's keyboard-driven TTY forms for Bash, file writes/edits, and common approval menus. |
+| Plan mode | Supported and live-tested, including long SDK prompts that Claude collapses into terminal paste forms. |
+| MCP | Native `--mcp-config` is passed to Claude; SDK in-process MCP servers are proxied through a temporary stdio MCP bridge. |
+| Forms / `AskUserQuestion` | Structured SDK questions are forwarded, and visible terminal forms are parsed as a fallback. SDK answers are textified and fed back into Claude. |
+| Streaming input | `--input-format stream-json` is accepted; multi-turn SDK stdin flows are supported. |
+| Model / permissions controls | SDK `set_model` and `set_permission_mode` update launch args and restart the idle TTY for the next turn. |
+| Thinking / effort / max turns | `--thinking`, `--thinking-display`, `--effort`, `--max-thinking-tokens`, and `--max-turns` are forwarded to Claude. |
+| Fast mode | Treated as Claude-owned terminal behavior. cctty does not implement a separate `set_fast_mode` SDK control yet. |
 
 ## Install
 
 ### Homebrew
 
-Install from the official tap:
-
 ```sh
 brew install Pyiner/cctty/cctty
 ```
 
-or tap once and install normally:
+or tap once:
 
 ```sh
 brew tap Pyiner/cctty
 brew install cctty
 ```
 
-The tap lives at
-[`Pyiner/homebrew-cctty`](https://github.com/Pyiner/homebrew-cctty).
-
 ### Release Binary
 
-Download the archive for your platform from GitHub Releases:
+Download a release archive:
 
 ```sh
 curl -L -o cctty.tar.gz \
-  https://github.com/Pyiner/cctty/releases/download/v0.1.0/cctty-0.1.0-aarch64-apple-darwin.tar.gz
+  https://github.com/Pyiner/cctty/releases/download/v0.2.0/cctty-0.2.0-aarch64-apple-darwin.tar.gz
 tar -xzf cctty.tar.gz
 sudo install -m 0755 cctty /usr/local/bin/cctty
 ```
@@ -118,18 +96,36 @@ cargo install --git https://github.com/Pyiner/cctty
 
 ## Quick Start
 
-First confirm the underlying Claude CLI is installed and authenticated:
+Confirm the real Claude CLI is installed and authenticated:
 
 ```sh
 claude --version
 cctty --version
 ```
 
-Run a direct CLI smoke test:
+Run a direct smoke test:
 
 ```sh
 cctty --print --output-format stream-json "Reply exactly CCTTY_OK"
 ```
+
+Point an SDK app at `cctty` instead of `claude`:
+
+```diff
+- cli_path="/path/to/claude"
++ cli_path="/path/to/cctty"
+```
+
+or in TypeScript:
+
+```diff
+- pathToClaudeCodeExecutable: "/path/to/claude"
++ pathToClaudeCodeExecutable: "/path/to/cctty"
+```
+
+Everything else stays on the official SDK: streaming messages, permission
+callbacks, `permissionMode`, `maxTurns`, `model`, `settingSources`, MCP config,
+and normal SDK options continue to flow through the SDK you already use.
 
 By default `cctty` finds `claude` on `PATH`. To point at a specific underlying
 Claude binary:
@@ -137,6 +133,23 @@ Claude binary:
 ```sh
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
+
+## Replacement Boundary
+
+`cctty` replaces the `claude` executable used by Claude Agent SDK apps and
+`claude -p` style non-interactive flows. It does **not** replace higher-level
+wrappers such as ACP servers, editor adapters, or project-specific agent
+runtimes.
+
+- If an app exposes `cli_path`, `pathToClaudeCodeExecutable`, or
+  `CLAUDE_CODE_EXECUTABLE`, point that setting at `cctty`.
+- If an app is an ACP adapter, keep the ACP adapter in place and configure its
+  internal Claude executable path to `cctty` when it offers one.
+- If a wrapper hard-codes `claude`, use a PATH shim or ask the wrapper to expose
+  the executable-path option.
+- `cctty --acp --stdio` is not a supported interface. `--acp` belongs to
+  third-party wrappers above Claude Code, not to the core Claude executable that
+  `cctty` replaces.
 
 ## Diagnostics
 
@@ -158,28 +171,8 @@ CCTTY_LOG=0 cctty --version
 CCTTY_LOG_TTY=1 CCTTY_LOG_FILE=/tmp/cctty.log cctty -p "Reply OK"
 ```
 
-`CCTTY_LOG_TTY=1` also records recent visible TTY text around waits/timeouts.
-Use it only for local debugging because that text can include prompts and model
-output.
-
-## Replacement Boundary
-
-`cctty` replaces the `claude` executable used by the Claude Agent SDK and
-`claude -p` style non-interactive flows. It does **not** replace higher-level
-wrappers such as ACP servers, editor adapters, or project-specific agent
-runtimes.
-
-That boundary is intentional:
-
-- If an app exposes `cli_path`, `pathToClaudeCodeExecutable`, or
-  `CLAUDE_CODE_EXECUTABLE`, point that setting at `cctty`.
-- If an app is an ACP adapter, keep the ACP adapter in place and configure its
-  internal Claude executable path to `cctty` when it offers one.
-- If a wrapper hard-codes `claude`, use a PATH shim or ask the wrapper to expose
-  the executable-path option.
-- `cctty --acp --stdio` is not a supported interface. `--acp` is not a current
-  Claude Code CLI option; it belongs to third-party wrappers that sit above
-  Claude Code.
+`CCTTY_LOG_TTY=1` records recent visible TTY text around waits/timeouts. Use it
+only for local debugging because that text can include prompts and model output.
 
 ## TypeScript SDK
 
@@ -449,8 +442,8 @@ CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_typescript_sdk_buil
 The repository includes GitHub Actions for CI and tagged releases.
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The release workflow builds macOS and Linux archives and publishes SHA-256

@@ -22,7 +22,7 @@ linux_x64="cctty-${version}-x86_64-unknown-linux-gnu.tar.gz"
 
 cat <<FORMULA
 class Cctty < Formula
-  desc "Drop-in Claude Agent SDK runner backed by the interactive Claude TTY"
+  desc "Claude Agent SDK compatibility through the interactive Claude Code TTY"
   homepage "https://github.com/${repo}"
   version "${version}"
   license "MIT"

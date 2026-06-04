@@ -49,8 +49,9 @@ jobs:
           archive="cctty-${version}-${{ matrix.target }}.tar.gz"
           mkdir -p "dist/${{ matrix.target }}"
           cp "target/${{ matrix.target }}/release/cctty" "dist/${{ matrix.target }}/"
-          cp README.md LICENSE "dist/${{ matrix.target }}/"
-          tar -C "dist/${{ matrix.target }}" -czf "dist/${archive}" cctty README.md LICENSE
+          cp README.md README.zh-CN.md LICENSE "dist/${{ matrix.target }}/"
+          cp -R assets "dist/${{ matrix.target }}/assets"
+          tar -C "dist/${{ matrix.target }}" -czf "dist/${archive}" cctty README.md README.zh-CN.md LICENSE assets
           shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
 
       - name: Upload build artifact
