@@ -80,7 +80,7 @@ fn stream_json_text_prompt_uses_tty_transcript() {
 
     assert_eq!(
         json_types(&lines),
-        ["system", "user", "assistant", "result"]
+        ["system", "user", "assistant", "result", "system"]
     );
     assert_eq!(lines[0]["session_id"], session_id);
     assert_eq!(lines[1]["message"]["content"], "Say OK");
@@ -655,8 +655,7 @@ fn stream_json_control_permission_mode_restart_recovers_from_stale_session_lock(
     )
     .unwrap();
     stdin.flush().unwrap();
-    let plan_response = read_json_line(&mut reader, &mut line);
-    assert_eq!(plan_response["type"], "control_response");
+    let plan_response = wait_for_control_response_line(&mut reader, &mut line);
     assert_eq!(plan_response["response"]["request_id"], "plan-after-prompt");
 
     writeln!(
@@ -973,8 +972,7 @@ fn stream_json_sdk_mcp_survives_control_restart_between_turns() {
     )
     .unwrap();
     stdin.flush().unwrap();
-    let model_response = read_json_line(&mut reader, &mut line);
-    assert_eq!(model_response["type"], "control_response");
+    let model_response = wait_for_control_response_line(&mut reader, &mut line);
     assert_eq!(
         model_response["response"]["request_id"],
         "set-model-after-mcp"
@@ -1028,6 +1026,27 @@ fn wait_for_result_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value 
     loop {
         let value = read_json_line(reader, line);
         if value.get("type").and_then(Value::as_str) == Some("result") {
+            return value;
+        }
+    }
+}
+
+fn wait_for_control_response_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value {
+    loop {
+        let value = read_json_line(reader, line);
+        if value.get("type").and_then(Value::as_str) == Some("control_response") {
+            return value;
+        }
+    }
+}
+
+fn wait_for_idle_session_state_line<R: BufRead>(reader: &mut R, line: &mut String) -> Value {
+    loop {
+        let value = read_json_line(reader, line);
+        if value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("session_state_changed")
+            && value.get("state").and_then(Value::as_str) == Some("idle")
+        {
             return value;
         }
     }
@@ -1443,7 +1462,7 @@ fn assert_stream_json_recovers_from_bad_resume_startup(fake_failure: &str) {
 }
 
 #[test]
-fn stream_json_emits_idle_session_state_when_sdk_requests_it() {
+fn stream_json_emits_idle_session_state_after_each_turn() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
@@ -1451,7 +1470,6 @@ fn stream_json_emits_idle_session_state_when_sdk_requests_it() {
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
         .env("CCTTY_CLAUDE_PATH", fixture.path())
         .env("CLAUDE_CONFIG_DIR", config_dir.path())
-        .env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
         .current_dir(workspace.path())
         .args([
             "--output-format",
@@ -1500,6 +1518,68 @@ fn stream_json_emits_idle_session_state_when_sdk_requests_it() {
         }),
         "stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn stream_json_synthetic_result_emits_idle_and_accepts_followup() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let session_id = "00000000-0000-0000-0000-000000000023";
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cctty"))
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .current_dir(workspace.path())
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--session-id",
+            session_id,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"OMIT_FAKE_RESULT first"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let first_result = wait_for_result_line(&mut reader, &mut line);
+    assert_eq!(
+        first_result["result"],
+        "FAKE_RESPONSE: OMIT_FAKE_RESULT first"
+    );
+    let idle = wait_for_idle_session_state_line(&mut reader, &mut line);
+    assert_eq!(idle["session_id"], session_id);
+
+    writeln!(
+        stdin,
+        r#"{{"type":"user","message":{{"role":"user","content":"Second prompt"}}}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let second_result = wait_for_result_line(&mut reader, &mut line);
+    assert_eq!(second_result["result"], "FAKE_RESPONSE: Second prompt");
+    drop(stdin);
+
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("cctty did not exit after stdin closed");
+        });
+    assert!(status.success());
 }
 
 #[test]

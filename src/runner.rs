@@ -1349,13 +1349,7 @@ fn emit_idle_session_state_if_requested(
     state: &mut TranscriptState,
     output_format: OutputFormat,
 ) -> Result<()> {
-    if output_format != OutputFormat::StreamJson
-        || state.saw_idle_session_state
-        || std::env::var("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS")
-            .ok()
-            .as_deref()
-            != Some("1")
-    {
+    if output_format != OutputFormat::StreamJson || state.saw_idle_session_state {
         return Ok(());
     }
     let value = json!({
