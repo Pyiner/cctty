@@ -222,7 +222,11 @@ startup_delay_ms = os.environ.get("FAKE_CLAUDE_STARTUP_DELAY_MS")
 if startup_delay_ms:
     time.sleep(int(startup_delay_ms) / 1000)
 
-ready_output = os.environ.get("FAKE_CLAUDE_READY_OUTPUT", "Context permissions /mcp\n")
+def write_ready_prompt():
+    sys.stdout.write("Context permissions /mcp\n")
+    sys.stdout.write("❯ \n")
+
+ready_output = os.environ.get("FAKE_CLAUDE_READY_OUTPUT", "Context permissions /mcp\n❯ \n")
 sys.stdout.write(ready_output)
 if ready_output and not ready_output.endswith("\n"):
     sys.stdout.write("\n")
@@ -274,9 +278,9 @@ while True:
         try:
             tty.setcbreak(fd)
             os.read(0, 4096)
+            sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.write("User declined to answer questions\n")
-            sys.stdout.write("❯ \n")
-            sys.stdout.write("Context permissions /mcp\n")
+            write_ready_prompt()
             sys.stdout.flush()
             feedback_bytes = b""
             while True:
@@ -302,7 +306,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-question-late-1","content":feedback}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -384,7 +388,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-question-1","content":feedback}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -410,7 +414,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-tty-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -438,7 +442,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-write-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -465,7 +469,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-search-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -491,7 +495,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"mcp-tool-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -518,7 +522,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-desc-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -566,7 +570,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-exit-plan-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -608,7 +612,7 @@ while True:
             f.write(json.dumps({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":response}]}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
             f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -620,7 +624,7 @@ while True:
             f.write(json.dumps({"type":"system","subtype":"init","session_id":session_id}) + "\n")
             f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
             f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -630,7 +634,7 @@ while True:
     if "STDOUT_ONLY_FAKE_RESULT" in prompt:
         sys.stdout.write("⏺ I inspected the repo and wrote conductor.json\n")
         sys.stdout.write("⎿ Wrote 5 lines to conductor.json\n")
-        sys.stdout.write("Context permissions /mcp\n")
+        write_ready_prompt()
         sys.stdout.flush()
         after = end + len(b"\x1b[201~")
         while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):
@@ -642,7 +646,7 @@ while True:
         f.write(json.dumps({"type":"user","message":{"role":"user","content":prompt}}) + "\n")
         f.write(json.dumps({"type":"assistant","message":{"model":"fake-model","content":[{"type":"text","text":response}]}}) + "\n")
         f.write(json.dumps({"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":False,"num_turns":1,"session_id":session_id,"result":response,"usage":{"input_tokens":1,"output_tokens":1}}) + "\n")
-    sys.stdout.write("Context permissions /mcp\n")
+    write_ready_prompt()
     sys.stdout.flush()
     after = end + len(b"\x1b[201~")
     while after < len(buf) and buf[after:after + 1] in (b"\r", b"\n"):

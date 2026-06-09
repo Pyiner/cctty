@@ -3269,7 +3269,9 @@ async fn wait_for_tty_permission_prompt(process: &PtyProcess, tool_use: &ToolUse
         if tty_output_has_permission_prompt(&output, tool_use) {
             return true;
         }
-        if tty_output_accepts_prompt(&output) && output_mentions_tool_result(&output, tool_use) {
+        if classify_tty_screen(&output).is_prompt_ready()
+            && output_mentions_tool_result(&output, tool_use)
+        {
             return false;
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
@@ -3289,7 +3291,7 @@ async fn wait_for_tty_plan_approval_prompt(process: &PtyProcess) -> bool {
         if tty_output_has_plan_approval_prompt(&output) {
             return true;
         }
-        if tty_output_accepts_prompt(&output) && !tty_output_has_plan_approval_prompt(&output) {
+        if classify_tty_screen(&output).is_prompt_ready() {
             return false;
         }
         tokio::time::sleep(TRANSCRIPT_POLL).await;
@@ -3332,7 +3334,7 @@ async fn wait_for_tty_question_feedback_target(
             || plain.contains("declined to answer questions")
             || plain.contains("declined to answer");
         if (question_was_dismissed || tty_question_from_form(&plain).is_none())
-            && tty_output_accepts_prompt(&plain)
+            && classify_tty_screen(&output).is_prompt_ready()
         {
             return Some(QuestionFeedbackTarget::MainPrompt);
         }
@@ -3462,37 +3464,143 @@ fn tty_output_has_plan_approval_prompt(output: &str) -> bool {
     has_plan_language && has_question && has_allow_choice && has_deny_choice
 }
 
-fn tty_wait_class(output: &str) -> &'static str {
-    let plain = plain_tty_output(output);
-    let compact = compact_tty_output(&plain);
-    if compact.is_empty() {
-        return "empty";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtyScreenState {
+    Empty,
+    WorkspaceTrustPrompt,
+    StartupChoicePrompt,
+    AutoModeConsentPrompt,
+    BadResumeStartupError,
+    PlanApproval,
+    QuestionForm,
+    PermissionPrompt,
+    Busy,
+    PromptReady,
+    Other,
+}
+
+impl TtyScreenState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::WorkspaceTrustPrompt => "workspace_trust_prompt",
+            Self::StartupChoicePrompt => "startup_choice_prompt",
+            Self::AutoModeConsentPrompt => "auto_mode_consent_prompt",
+            Self::BadResumeStartupError => "bad_resume_startup_error",
+            Self::PlanApproval => "plan_approval",
+            Self::QuestionForm => "question_form",
+            Self::PermissionPrompt => "permission_prompt",
+            Self::Busy => "busy",
+            Self::PromptReady => "prompt_ready",
+            Self::Other => "other",
+        }
     }
-    if tty_output_has_plan_approval_prompt(output) {
-        return "plan_approval";
+
+    fn is_prompt_ready(self) -> bool {
+        self == Self::PromptReady
     }
-    if tty_question_from_form(&plain).is_some() {
-        return "question_form";
+}
+
+struct TtyScreen {
+    text: String,
+    compact: String,
+    lines: Vec<String>,
+}
+
+impl TtyScreen {
+    fn render(output: &str) -> Self {
+        let lines = visible_tty_lines(output);
+        let text = if lines.is_empty() {
+            plain_tty_output(output)
+        } else {
+            lines.join(" ")
+        };
+        let compact = compact_tty_output(&text);
+        Self {
+            text,
+            compact,
+            lines,
+        }
     }
-    if plain_tty_output_has_file_permission_prompt(&plain)
-        || plain_tty_output_has_permission_prompt_for_tool(&plain, "Bash")
-        || plain_tty_output_has_generic_permission_prompt(&plain)
+
+    fn is_empty(&self) -> bool {
+        self.compact.is_empty()
+    }
+
+    fn has_busy_indicator(&self) -> bool {
+        (self.text.contains("Esc") && self.text.contains("interrupt"))
+            || self.compact.contains("Esctointerrupt")
+    }
+
+    fn has_choice_menu_controls(&self) -> bool {
+        self.text.contains("Enter to confirm")
+            || self.text.contains("Enter to select")
+            || self.text.contains("Esc to cancel")
+            || self.text.contains("Tab/Arrow keys to navigate")
+            || self.compact.contains("Entertoconfirm")
+            || self.compact.contains("Entertoselect")
+            || self.compact.contains("Esctocancel")
+            || self.compact.contains("Tab/Arrowkeystonavigate")
+    }
+
+    fn has_prompt_input_marker(&self) -> bool {
+        if self.has_choice_menu_controls() {
+            return false;
+        }
+        if self.lines.is_empty() {
+            return line_has_prompt_input_marker(&self.text);
+        }
+        self.lines
+            .iter()
+            .rev()
+            .any(|line| line_has_prompt_input_marker(line))
+    }
+}
+
+fn line_has_prompt_input_marker(line: &str) -> bool {
+    line.contains('❯')
+}
+
+fn classify_tty_screen(output: &str) -> TtyScreenState {
+    let screen = TtyScreen::render(output);
+    if screen.is_empty() {
+        return TtyScreenState::Empty;
+    }
+    if tty_output_has_workspace_trust_prompt(&screen.text) {
+        return TtyScreenState::WorkspaceTrustPrompt;
+    }
+    if tty_output_has_startup_choice_prompt(&screen.text) {
+        return TtyScreenState::StartupChoicePrompt;
+    }
+    if tty_output_has_auto_mode_consent_prompt(&screen.text) {
+        return TtyScreenState::AutoModeConsentPrompt;
+    }
+    if tty_output_has_bad_resume_startup_error(&screen.text) {
+        return TtyScreenState::BadResumeStartupError;
+    }
+    if tty_output_has_plan_approval_prompt(&screen.text) {
+        return TtyScreenState::PlanApproval;
+    }
+    if tty_question_from_form(&screen.text).is_some() {
+        return TtyScreenState::QuestionForm;
+    }
+    if plain_tty_output_has_file_permission_prompt(&screen.text)
+        || plain_tty_output_has_permission_prompt_for_tool(&screen.text, "Bash")
+        || plain_tty_output_has_generic_permission_prompt(&screen.text)
     {
-        return "permission_prompt";
+        return TtyScreenState::PermissionPrompt;
     }
-    if compact.contains("RemoteControlfailed") {
-        return "remote_control_failed";
+    if screen.has_busy_indicator() {
+        return TtyScreenState::Busy;
     }
-    if compact.contains("RemoteControlactive") {
-        return "remote_control_active";
+    if screen.has_prompt_input_marker() {
+        return TtyScreenState::PromptReady;
     }
-    if tty_output_accepts_prompt(output) {
-        return "prompt_ready";
-    }
-    if compact.contains("Esc") && compact.contains("interrupt") {
-        return "busy";
-    }
-    "other"
+    TtyScreenState::Other
+}
+
+fn tty_wait_class(output: &str) -> &'static str {
+    classify_tty_screen(output).as_str()
 }
 
 fn tty_progress_snapshot(process: &PtyProcess) -> String {
@@ -3726,30 +3834,31 @@ async fn prepare_tty_for_prompt(process: &mut PtyProcess) -> Result<()> {
     let mut auto_mode_ack_sent = false;
     loop {
         let output = process.recent_output();
-        if tty_output_has_workspace_trust_prompt(&output) && !trust_prompt_ack_sent {
+        let screen_state = classify_tty_screen(&output);
+        if screen_state == TtyScreenState::WorkspaceTrustPrompt && !trust_prompt_ack_sent {
             process.write_all(b"\r")?;
             trust_prompt_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_startup_choice_prompt(&output) && !startup_choice_ack_sent {
+        if screen_state == TtyScreenState::StartupChoicePrompt && !startup_choice_ack_sent {
             process.write_all(b"\r")?;
             startup_choice_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_auto_mode_consent_prompt(&output) && !auto_mode_ack_sent {
+        if screen_state == TtyScreenState::AutoModeConsentPrompt && !auto_mode_ack_sent {
             process.write_all(b"2\r")?;
             auto_mode_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_bad_resume_startup_error(&output) {
+        if screen_state == TtyScreenState::BadResumeStartupError {
             let recent = recent_tty_log_text(&output, 600);
             logging::event(format!("tty_startup_bad_resume recent={recent}"));
             return Err(CcttyError::Tty(recent));
         }
-        if tty_output_accepts_prompt(&output) {
+        if screen_state.is_prompt_ready() {
             tokio::time::sleep(TTY_READY_SETTLE).await;
             logging::event(format!(
                 "tty_ready stage=prepare elapsed_ms={}",
@@ -3789,30 +3898,31 @@ async fn prepare_tty_for_prompt_with_mcp(
     loop {
         service_pending_mcp_proxy_requests_for_runtime(input, runtime, sdk_state).await?;
         let output = process.recent_output();
-        if tty_output_has_workspace_trust_prompt(&output) && !trust_prompt_ack_sent {
+        let screen_state = classify_tty_screen(&output);
+        if screen_state == TtyScreenState::WorkspaceTrustPrompt && !trust_prompt_ack_sent {
             process.write_all(b"\r")?;
             trust_prompt_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_startup_choice_prompt(&output) && !startup_choice_ack_sent {
+        if screen_state == TtyScreenState::StartupChoicePrompt && !startup_choice_ack_sent {
             process.write_all(b"\r")?;
             startup_choice_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_auto_mode_consent_prompt(&output) && !auto_mode_ack_sent {
+        if screen_state == TtyScreenState::AutoModeConsentPrompt && !auto_mode_ack_sent {
             process.write_all(b"2\r")?;
             auto_mode_ack_sent = true;
             tokio::time::sleep(TRUST_PROMPT_SETTLE).await;
             continue;
         }
-        if tty_output_has_bad_resume_startup_error(&output) {
+        if screen_state == TtyScreenState::BadResumeStartupError {
             let recent = recent_tty_log_text(&output, 600);
             logging::event(format!("tty_startup_bad_resume recent={recent}"));
             return Err(CcttyError::Tty(recent));
         }
-        if tty_output_accepts_prompt(&output) {
+        if screen_state.is_prompt_ready() {
             tokio::time::sleep(TTY_READY_SETTLE).await;
             logging::event(format!(
                 "tty_ready stage=prepare_mcp elapsed_ms={}",
@@ -3878,32 +3988,7 @@ fn tty_output_has_missing_resume_startup_error(output: &str) -> bool {
 }
 
 fn tty_output_accepts_prompt(output: &str) -> bool {
-    let output = plain_tty_output(output);
-    let compact = compact_tty_output(&output);
-    let has_status = output.contains("permissions")
-        || output.contains("Remote Control failed")
-        || output.contains("Remote Control active")
-        || output.contains("MCP server failed")
-        || output.contains("/mcp")
-        || compact.contains("permissions")
-        || compact.contains("RemoteControlfailed")
-        || compact.contains("RemoteControlactive")
-        || compact.contains("MCPserverfailed")
-        || compact.contains("/mcp");
-    let has_ready_status = output.contains("auto mode on")
-        || output.contains("plan mode on")
-        || output.contains("shift+tab to cycle")
-        || output.contains("for agents")
-        || output.contains("/effort")
-        || compact.contains("automodeon")
-        || compact.contains("planmodeon")
-        || compact.contains("shift+tabtocycle")
-        || compact.contains("foragents")
-        || compact.contains("/effort");
-    let has_prompt_marker = output.contains('❯') || compact.contains('❯');
-    ((output.contains("Context") || compact.contains("Context")) && has_status)
-        || (has_prompt_marker && has_status)
-        || (has_prompt_marker && has_ready_status)
+    classify_tty_screen(output).is_prompt_ready()
 }
 
 fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
@@ -4155,6 +4240,26 @@ mod tests {
             output,
             "Write a compact document for SDK users"
         ));
+    }
+
+    #[test]
+    fn does_not_accept_status_without_prompt_marker_as_ready() {
+        let output = "Context permissions /mcp";
+
+        assert_eq!(tty_wait_class(output), "other");
+        assert!(!tty_output_accepts_prompt(output));
+    }
+
+    #[test]
+    fn does_not_accept_choice_menu_prompt_marker_as_ready() {
+        let output = "\
+            Do you want to proceed?\r\n\
+            ❯ 1. Yes\r\n\
+              2. No\r\n\
+            Enter to confirm · Esc to cancel";
+
+        assert_eq!(tty_wait_class(output), "permission_prompt");
+        assert!(!tty_output_accepts_prompt(output));
     }
 
     #[test]
@@ -4610,6 +4715,21 @@ mod tests {
 
         assert!(tty_output_accepts_prompt(output));
         assert_eq!(tty_wait_class(output), "prompt_ready");
+    }
+
+    #[test]
+    fn classifies_rendered_screen_after_ansi_clear_as_prompt_ready() {
+        let output = "\
+            Do you want to proceed?\r\n\
+            ❯ 1. Yes\r\n\
+              2. No\r\n\
+            Enter to confirm · Esc to cancel\
+            \u{1b}[2J\u{1b}[H\
+            [Opus 4.8] │ workspace Context ░░░░░░░░░░ 0%\r\n\
+            ❯ ";
+
+        assert_eq!(tty_wait_class(output), "prompt_ready");
+        assert!(tty_output_accepts_prompt(output));
     }
 
     #[cfg(unix)]
