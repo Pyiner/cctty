@@ -3890,9 +3890,20 @@ fn tty_output_accepts_prompt(output: &str) -> bool {
         || compact.contains("RemoteControlactive")
         || compact.contains("MCPserverfailed")
         || compact.contains("/mcp");
+    let has_ready_status = output.contains("auto mode on")
+        || output.contains("plan mode on")
+        || output.contains("shift+tab to cycle")
+        || output.contains("for agents")
+        || output.contains("/effort")
+        || compact.contains("automodeon")
+        || compact.contains("planmodeon")
+        || compact.contains("shift+tabtocycle")
+        || compact.contains("foragents")
+        || compact.contains("/effort");
     let has_prompt_marker = output.contains('❯') || compact.contains('❯');
     ((output.contains("Context") || compact.contains("Context")) && has_status)
         || (has_prompt_marker && has_status)
+        || (has_prompt_marker && has_ready_status)
 }
 
 fn tty_output_still_editing_prompt(output: &str, prompt: &str) -> bool {
@@ -4583,6 +4594,22 @@ mod tests {
             Remote Control active ────── ↯ Remote Control active";
 
         assert!(tty_output_accepts_prompt(output));
+    }
+
+    #[test]
+    fn accepts_plain_claude_status_screen_as_prompt_ready() {
+        let output = "\
+            ───────────────────────────────────────────────────────────────────────────────────────────────────────── \
+            ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents ● high · /effort \
+            ▎ Opus 4.8 is here! Now defaults to high effort · /effort xhigh for your hardest tasks \
+            ❯ T ry \"create a util logging.py that...\" \
+            ──────────────────────────────────────────────────────────────────────────────────────────────────────── \
+            ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents ● high · /effort \
+            [Opus 4.8 (1M context)] ░░░░░░░░░░ 0% | git:( master ) \
+            ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents";
+
+        assert!(tty_output_accepts_prompt(output));
+        assert_eq!(tty_wait_class(output), "prompt_ready");
     }
 
     #[cfg(unix)]

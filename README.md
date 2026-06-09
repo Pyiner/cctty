@@ -77,7 +77,7 @@ Download a release archive:
 
 ```sh
 curl -L -o cctty.tar.gz \
-  https://github.com/Pyiner/cctty/releases/download/v0.2.2/cctty-0.2.2-aarch64-apple-darwin.tar.gz
+  https://github.com/Pyiner/cctty/releases/download/v0.2.3/cctty-0.2.3-aarch64-apple-darwin.tar.gz
 tar -xzf cctty.tar.gz
 sudo install -m 0755 cctty /usr/local/bin/cctty
 ```
@@ -442,8 +442,8 @@ CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_typescript_sdk_buil
 The repository includes GitHub Actions for CI and tagged releases.
 
 ```sh
-git tag v0.2.2
-git push origin v0.2.2
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 The release workflow builds macOS and Linux archives and publishes SHA-256
