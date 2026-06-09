@@ -18,7 +18,7 @@ sha_for() {
 
 mac_arm="cctty-${version}-aarch64-apple-darwin.tar.gz"
 mac_intel="cctty-${version}-x86_64-apple-darwin.tar.gz"
-linux_x64="cctty-${version}-x86_64-unknown-linux-gnu.tar.gz"
+linux_x64="cctty-${version}-x86_64-unknown-linux-musl.tar.gz"
 
 cat <<FORMULA
 class Cctty < Formula

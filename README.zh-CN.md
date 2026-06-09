@@ -85,7 +85,7 @@ brew install cctty
 
 ```sh
 curl -L -o cctty.tar.gz \
-  https://github.com/Pyiner/cctty/releases/download/v0.2.1/cctty-0.2.1-aarch64-apple-darwin.tar.gz
+  https://github.com/Pyiner/cctty/releases/download/v0.2.2/cctty-0.2.2-aarch64-apple-darwin.tar.gz
 tar -xzf cctty.tar.gz
 sudo install -m 0755 cctty /usr/local/bin/cctty
 ```
@@ -94,7 +94,7 @@ sudo install -m 0755 cctty /usr/local/bin/cctty
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
+- `x86_64-unknown-linux-musl`（Linux 静态构建，不要求目标机有较新的 glibc）
 
 ### 从源码安装
 
@@ -294,8 +294,8 @@ CCTTY_LIVE_SDK_GAME=1 cargo test --test sdk_integration live_typescript_sdk_buil
 仓库包含 GitHub Actions CI 和 tag release。发布新版本：
 
 ```sh
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 Release workflow 会构建 macOS / Linux archive、生成 SHA-256，并在配置了
