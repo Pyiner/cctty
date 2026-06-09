@@ -88,8 +88,12 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Warn when Homebrew tap token is missing
+        if: ${{ env.HOMEBREW_TAP_TOKEN == '' }}
+        run: |
+          echo "::warning::HOMEBREW_TAP_TOKEN is not configured; release assets will be published but Pyiner/homebrew-cctty will not be updated automatically."
+
       - name: Generate Homebrew formula
-        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
         run: |
           bash scripts/generate-homebrew-formula.sh "${GITHUB_REPOSITORY}" "${GITHUB_REF_NAME}" dist > dist/cctty.rb
 
