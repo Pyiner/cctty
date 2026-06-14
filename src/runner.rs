@@ -1025,7 +1025,7 @@ async fn submit_prompt_and_tail(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    submit_prompt_to_tty(process, prompt).await?;
+    submit_prompt_to_tty(process, tail, prompt).await?;
     tail_until_complete(process, tail, output_format, include_partial_messages).await
 }
 
@@ -1040,7 +1040,7 @@ async fn submit_prompt_and_tail_stream(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    submit_prompt_to_tty(process, prompt).await?;
+    submit_prompt_to_tty(process, tail, prompt).await?;
     tail_until_complete_stream(
         process,
         tail,
@@ -1053,22 +1053,76 @@ async fn submit_prompt_and_tail_stream(
     .await
 }
 
-async fn submit_prompt_to_tty(process: &mut PtyProcess, prompt: &str) -> Result<()> {
+async fn submit_prompt_to_tty(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    prompt: &str,
+) -> Result<()> {
     logging::event(format!(
         "prompt_submit start content_chars={}",
         prompt.chars().count()
     ));
-    process.write_all(&bracketed_paste_input(prompt))?;
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    maybe_log_submit_tty_diagnostic(process, "after_paste");
-    if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
-        logging::event("prompt_submit_retry reason=prompt_still_visible");
-        process.write_all(b"\r")?;
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        maybe_log_submit_tty_diagnostic(process, "after_retry_enter");
+    // Confirm the submission via the transcript (an ACK that Claude actually
+    // accepted the message) instead of trusting the on-screen state. When Claude
+    // is slow to become input-ready — connecting MCP servers, or right after the
+    // workspace-trust dialog is dismissed — the paste lands on a transitional
+    // screen, the "still editing" heuristic reads false, no Enter is sent, and
+    // the message is silently dropped. If no transcript activity appears within
+    // the window, clear the line and re-submit (always pressing Enter).
+    const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_ATTEMPTS: usize = 4;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt == 0 {
+            process.write_all(&bracketed_paste_input(prompt))?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            maybe_log_submit_tty_diagnostic(process, "after_paste");
+            if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
+                process.write_all(b"\r")?;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                maybe_log_submit_tty_diagnostic(process, "after_enter");
+            }
+        } else {
+            logging::event(format!(
+                "prompt_submit_retry attempt={attempt} reason=no_transcript_ack"
+            ));
+            process.write_all(b"\x1b")?; // Esc: dismiss any stray menu
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            process.write_all(b"\x15")?; // Ctrl-U: clear the input line
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            process.write_all(&bracketed_paste_input(prompt))?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            maybe_log_submit_tty_diagnostic(process, "after_repaste");
+            process.write_all(b"\r")?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            maybe_log_submit_tty_diagnostic(process, "after_retry_enter");
+        }
+        if wait_for_transcript_ack(tail, ACK_TIMEOUT).await? {
+            logging::event(format!("prompt_submit done attempt={attempt} ack=true"));
+            return Ok(());
+        }
     }
-    logging::event("prompt_submit done");
+    logging::event("prompt_submit done ack=false");
     Ok(())
+}
+
+/// Wait until the target transcript shows new bytes — Claude's acknowledgement
+/// that it accepted the submitted prompt — or the timeout elapses.
+async fn wait_for_transcript_ack(tail: &mut TailCursor, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(path) = tail.resolve_path()? {
+            if std::fs::metadata(&path)
+                .map(|meta| meta.len() > tail.offset)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 fn maybe_log_prompt_diagnostic(prompt: &str) {
@@ -2985,7 +3039,12 @@ async fn cancel_tty_question(process: &mut PtyProcess, feedback: Option<&str>) -
                 process.write_all(&bracketed_paste_input(feedback))?;
             }
             Some(QuestionFeedbackTarget::MainPrompt) => {
-                submit_prompt_to_tty(process, feedback).await?;
+                process.write_all(&bracketed_paste_input(feedback))?;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                if tty_output_still_editing_prompt(&process.recent_output(), feedback) {
+                    process.write_all(b"\r")?;
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
             }
             None => {}
         }
@@ -3952,8 +4011,17 @@ async fn prepare_tty_for_prompt_with_mcp(
 fn tty_output_has_workspace_trust_prompt(output: &str) -> bool {
     let output = plain_tty_output(output);
     let compact = compact_tty_output(&output);
-    (output.contains("Quick safety check") || compact.contains("Quicksafetycheck"))
-        && (output.contains("Yes, I trust this folder") || compact.contains("Yes,Itrustthisfolder"))
+    // "Yes, I trust this folder" is the stable affirmative across Claude Code
+    // versions. Older builds also rendered a "Quick safety check" title, but
+    // 2.1.x dropped it (the dialog now reads "...take a moment to review what's
+    // in this folder..." with a "Security guide" link). Requiring the old title
+    // left the 2.1.x trust dialog unrecognized, so startup stalled on it instead
+    // of auto-acknowledging. Match on the affirmative alone, keeping the legacy
+    // title as an additional accepted marker.
+    output.contains("Yes, I trust this folder")
+        || compact.contains("Yes,Itrustthisfolder")
+        || output.contains("Quick safety check")
+        || compact.contains("Quicksafetycheck")
 }
 
 fn tty_output_has_startup_choice_prompt(output: &str) -> bool {
@@ -4182,6 +4250,23 @@ mod tests {
             String::from_utf8(bracketed_paste_input("a\r\nb")).unwrap(),
             "\u{1b}[200~a\nb\u{1b}[201~\r"
         );
+    }
+
+    #[test]
+    fn recognizes_workspace_trust_prompt_across_versions() {
+        // Claude Code 2.1.x dialog — the old "Quick safety check" title is gone.
+        let v2 = "Do you trust the files in this folder? /tmp/x \
+            take a moment to review what's in this folder first. \
+            Claude Code'll be able to read, edit, and execute files here. Security guide \
+            ❯ 1. Yes, I trust this folder  2. No, suggest changes (esc)";
+        assert!(tty_output_has_workspace_trust_prompt(v2));
+        assert_eq!(classify_tty_screen(v2), TtyScreenState::WorkspaceTrustPrompt);
+        // Legacy dialog with the old title still matches.
+        let legacy = "Quick safety check ❯ 1. Yes, I trust this folder  2. No";
+        assert!(tty_output_has_workspace_trust_prompt(legacy));
+        // A normal prompt-ready screen must not be misread as the trust dialog.
+        let ready = "❯ Try \"fix lint errors\"  ? for shortcuts";
+        assert!(!tty_output_has_workspace_trust_prompt(ready));
     }
 
     #[test]
