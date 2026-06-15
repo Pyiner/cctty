@@ -4260,7 +4260,10 @@ mod tests {
             Claude Code'll be able to read, edit, and execute files here. Security guide \
             ❯ 1. Yes, I trust this folder  2. No, suggest changes (esc)";
         assert!(tty_output_has_workspace_trust_prompt(v2));
-        assert_eq!(classify_tty_screen(v2), TtyScreenState::WorkspaceTrustPrompt);
+        assert_eq!(
+            classify_tty_screen(v2),
+            TtyScreenState::WorkspaceTrustPrompt
+        );
         // Legacy dialog with the old title still matches.
         let legacy = "Quick safety check ❯ 1. Yes, I trust this folder  2. No";
         assert!(tty_output_has_workspace_trust_prompt(legacy));
