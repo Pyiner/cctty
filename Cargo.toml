@@ -1,6 +1,6 @@
 [package]
 name = "cctty"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Claude Agent SDK compatibility through the interactive Claude Code TTY"
 license = "MIT"

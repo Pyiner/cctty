@@ -1025,7 +1025,7 @@ async fn submit_prompt_and_tail(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    submit_prompt_to_tty(process, tail, prompt).await?;
+    submit_prompt_to_tty(process, tail, prompt, true).await?;
     tail_until_complete(process, tail, output_format, include_partial_messages).await
 }
 
@@ -1040,7 +1040,13 @@ async fn submit_prompt_and_tail_stream(
     include_partial_messages: bool,
 ) -> Result<TranscriptState> {
     tail.prepare_offset()?;
-    submit_prompt_to_tty(process, tail, prompt).await?;
+    submit_prompt_to_tty(
+        process,
+        tail,
+        prompt,
+        sdk_state.sdk_mcp_server_names().is_empty(),
+    )
+    .await?;
     tail_until_complete_stream(
         process,
         tail,
@@ -1057,11 +1063,29 @@ async fn submit_prompt_to_tty(
     process: &mut PtyProcess,
     tail: &mut TailCursor,
     prompt: &str,
+    confirm_via_ack: bool,
 ) -> Result<()> {
     logging::event(format!(
         "prompt_submit start content_chars={}",
         prompt.chars().count()
     ));
+    if !confirm_via_ack {
+        // Plain submit: paste, and press Enter only if the prompt is still
+        // visibly being edited. Used when an SDK MCP runtime is active — its
+        // control-channel negotiation (initialize/tools-list/tools-call) would be
+        // disrupted by the ACK path's clear-and-re-paste.
+        process.write_all(&bracketed_paste_input(prompt))?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        maybe_log_submit_tty_diagnostic(process, "after_paste");
+        if tty_output_still_editing_prompt(&process.recent_output(), prompt) {
+            logging::event("prompt_submit_retry reason=prompt_still_visible");
+            process.write_all(b"\r")?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            maybe_log_submit_tty_diagnostic(process, "after_retry_enter");
+        }
+        logging::event("prompt_submit done");
+        return Ok(());
+    }
     // Confirm the submission via the transcript (an ACK that Claude actually
     // accepted the message) instead of trusting the on-screen state. When Claude
     // is slow to become input-ready — connecting MCP servers, or right after the
@@ -1096,7 +1120,7 @@ async fn submit_prompt_to_tty(
             tokio::time::sleep(Duration::from_millis(120)).await;
             maybe_log_submit_tty_diagnostic(process, "after_retry_enter");
         }
-        if wait_for_transcript_ack(tail, ACK_TIMEOUT).await? {
+        if wait_for_transcript_ack(process, tail, ACK_TIMEOUT).await? {
             logging::event(format!("prompt_submit done attempt={attempt} ack=true"));
             return Ok(());
         }
@@ -1105,11 +1129,22 @@ async fn submit_prompt_to_tty(
     Ok(())
 }
 
-/// Wait until the target transcript shows new bytes — Claude's acknowledgement
-/// that it accepted the submitted prompt — or the timeout elapses.
-async fn wait_for_transcript_ack(tail: &mut TailCursor, timeout: Duration) -> Result<bool> {
+/// Confirm Claude accepted the submitted prompt. Returns true as soon as the
+/// transcript shows new bytes, or Claude is clearly producing (busy) / has
+/// finished a turn that leaves no transcript (cctty synthesizes it downstream).
+/// Returns false only while Claude sits at a clean, idle prompt with no
+/// transcript — i.e. the paste didn't land and the caller should re-submit. This
+/// reuses the same completion heuristics as the tail loop so fake-Claude /
+/// no-transcript turns aren't mistaken for a dropped paste.
+async fn wait_for_transcript_ack(
+    process: &mut PtyProcess,
+    tail: &mut TailCursor,
+    timeout: Duration,
+) -> Result<bool> {
     let deadline = Instant::now() + timeout;
+    let mut progress = TtyVisibleProgress::new(process);
     loop {
+        progress.observe(process);
         if let Some(path) = tail.resolve_path()? {
             if std::fs::metadata(&path)
                 .map(|meta| meta.len() > tail.offset)
@@ -1118,10 +1153,15 @@ async fn wait_for_transcript_ack(tail: &mut TailCursor, timeout: Duration) -> Re
                 return Ok(true);
             }
         }
+        if tty_wait_class(&process.recent_output()) != "prompt_ready"
+            || progress.completed_without_transcript(process)
+        {
+            return Ok(true);
+        }
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
