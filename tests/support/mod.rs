@@ -245,6 +245,17 @@ while True:
     raw_prompt = buf[start + len(b"\x1b[200~"):end] if start >= 0 else buf[:end]
     prompt = raw_prompt.decode("utf-8", errors="replace")
     response = "FAKE_RESPONSE: " + prompt
+    if "START_BACKGROUND_SERVICE" in prompt:
+        pid_path = os.environ.get("FAKE_CLAUDE_BACKGROUND_PID_PATH")
+        if not pid_path:
+            raise RuntimeError("missing FAKE_CLAUDE_BACKGROUND_PID_PATH")
+        child = subprocess.Popen(
+            ["sh", "-c", "trap '' HUP; exec sleep 600"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        Path(pid_path).write_text(str(child.pid), encoding="utf-8")
     if "USE_TTY_FIRST_FAKE_ASK_USER_QUESTION" in prompt:
         question_input = {
             "questions": [

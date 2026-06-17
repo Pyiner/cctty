@@ -85,6 +85,34 @@ impl PtyProcess {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+
+    pub fn finish(&mut self, timeout: Duration) {
+        if self.pid <= 0 {
+            return;
+        }
+        let pid = self.pid;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let started = Instant::now();
+        loop {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if result == pid || result < 0 {
+                self.pid = 0;
+                return;
+            }
+            if started.elapsed() >= timeout {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                self.pid = 0;
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for PtyProcess {

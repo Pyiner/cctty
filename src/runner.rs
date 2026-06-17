@@ -196,7 +196,7 @@ async fn run_print(invocation: Invocation) -> Result<i32> {
         }
     }
 
-    process.terminate(PTY_TERMINATE_TIMEOUT);
+    process.finish(PTY_TERMINATE_TIMEOUT);
     if invocation.no_session_persistence {
         tail.remove_current_transcript()?;
     }

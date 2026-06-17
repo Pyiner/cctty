@@ -92,6 +92,48 @@ fn stream_json_text_prompt_uses_tty_transcript() {
 }
 
 #[test]
+#[cfg(unix)]
+fn normal_print_completion_preserves_hup_immune_background_process() {
+    let fixture = FakeClaude::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let background_pid_path = workspace.path().join("background.pid");
+
+    let output = Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("CLAUDE_CONFIG_DIR", config_dir.path())
+        .env("FAKE_CLAUDE_BACKGROUND_PID_PATH", &background_pid_path)
+        .current_dir(workspace.path())
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "START_BACKGROUND_SERVICE",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pid = std::fs::read_to_string(&background_pid_path)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let _guard = BackgroundPidGuard { pid };
+
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        process_exists(pid),
+        "user-started background process {pid} should survive normal cctty completion"
+    );
+}
+
+#[test]
 fn stream_json_remote_control_active_screen_accepts_prompt() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();
@@ -2640,4 +2682,29 @@ fn json_types(lines: &[Value]) -> Vec<&str> {
         .iter()
         .map(|line| line["type"].as_str().unwrap())
         .collect()
+}
+
+#[cfg(unix)]
+struct BackgroundPidGuard {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for BackgroundPidGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGTERM);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        if process_exists(self.pid) {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
