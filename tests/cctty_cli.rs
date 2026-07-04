@@ -41,6 +41,97 @@ fn writes_diagnostic_log_to_configured_file() {
 }
 
 #[test]
+fn auth_status_subcommand_passthrough() {
+    let fixture = FakeClaude::new();
+    let argv = tempfile::NamedTempFile::new().unwrap();
+
+    let output = Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value = serde_json::from_str::<Value>(&stdout).unwrap();
+    assert_eq!(value["loggedIn"], true);
+    assert_eq!(value["orgName"], "Test Org");
+    let argv_text = std::fs::read_to_string(argv.path()).unwrap();
+    let args = serde_json::from_str::<Vec<String>>(&argv_text).unwrap();
+    assert_eq!(args, ["auth", "status", "--json"].map(str::to_owned));
+}
+
+#[test]
+fn auth_login_json_events_returns_url_prompt_success_and_exit() {
+    let fixture = FakeClaude::new();
+    let argv = tempfile::NamedTempFile::new().unwrap();
+
+    let output = Command::cargo_bin("cctty")
+        .unwrap()
+        .env("CCTTY_CLAUDE_PATH", fixture.path())
+        .env("FAKE_CLAUDE_ARGV_PATH", argv.path())
+        .args(["auth", "login", "--json-events", "--claudeai"])
+        .write_stdin("test-code#fake-state\n")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("test-code"),
+        "stdout leaked auth code:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("test-code"),
+        "stderr leaked auth code:\n{stderr}"
+    );
+
+    let lines = stdout
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.first().unwrap()["type"], "started");
+    assert_eq!(lines.first().unwrap()["args"][0], "auth");
+    assert_eq!(lines.first().unwrap()["args"][1], "login");
+    assert!(
+        !lines.first().unwrap()["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg.as_str() == Some("--json-events"))
+    );
+    assert!(lines.iter().any(|line| {
+        line["type"] == "authorization_url"
+            && line["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("https://claude.test/oauth/authorize"))
+    }));
+    assert!(lines.iter().any(|line| {
+        line["type"] == "input_requested" && line["input"] == "authorization_code"
+    }));
+    assert!(lines.iter().any(|line| line["type"] == "success"));
+    assert!(
+        lines
+            .iter()
+            .any(|line| { line["type"] == "exit" && line["exit_code"].as_i64() == Some(0) })
+    );
+
+    let argv_text = std::fs::read_to_string(argv.path()).unwrap();
+    let args = serde_json::from_str::<Vec<String>>(&argv_text).unwrap();
+    assert_eq!(args, ["auth", "login", "--claudeai"].map(str::to_owned));
+}
+
+#[test]
 fn stream_json_text_prompt_uses_tty_transcript() {
     let fixture = FakeClaude::new();
     let workspace = tempfile::tempdir().unwrap();

@@ -71,6 +71,34 @@ if "--help" in sys.argv or "-h" in sys.argv:
     print("  --agents <json>")
     sys.exit(0)
 
+if len(sys.argv) >= 3 and sys.argv[1:3] == ["auth", "status"]:
+    print(json.dumps({
+        "loggedIn": True,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "email": "test@example.com",
+        "orgId": "00000000-0000-0000-0000-000000000001",
+        "orgName": "Test Org",
+        "subscriptionType": "team",
+    }))
+    sys.exit(0)
+
+if len(sys.argv) >= 3 and sys.argv[1:3] == ["auth", "logout"]:
+    print("Logged out")
+    sys.exit(0)
+
+if len(sys.argv) >= 3 and sys.argv[1:3] == ["auth", "login"]:
+    print("Opening browser to sign in…")
+    print("If the browser didn't open, visit: https://claude.test/oauth/authorize?code=true&state=fake-state#fake-state")
+    sys.stdout.write("Paste code here if prompted > ")
+    sys.stdout.flush()
+    code = sys.stdin.readline().strip()
+    if code == "test-code#fake-state":
+        print("Login successful.")
+        sys.exit(0)
+    print("Login failed.")
+    sys.exit(1)
+
 fail_session_args = os.environ.get("FAKE_CLAUDE_FAIL_SESSION_ARGS")
 if fail_session_args:
     session_flags = ("--session-id", "--resume", "-r", "--continue", "-c", "--resume-session-at")

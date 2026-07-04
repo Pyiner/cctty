@@ -17,6 +17,7 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandMode {
+    AuthLoginJsonEvents,
     Passthrough,
     Print,
 }
@@ -39,6 +40,9 @@ pub struct Invocation {
 impl Invocation {
     pub fn parse(argv: Vec<String>) -> Result<Self> {
         let mut args = argv.into_iter().skip(1).collect::<Vec<_>>();
+        if args.first().map(String::as_str) == Some("auth") {
+            return Ok(Self::auth(args));
+        }
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(Self::passthrough(args));
         }
@@ -251,6 +255,33 @@ impl Invocation {
         Self {
             mode: CommandMode::Passthrough,
             passthrough_args: args,
+            prompt: None,
+            input_format: InputFormat::Text,
+            output_format: OutputFormat::Text,
+            session_id: None,
+            resume: None,
+            continue_conversation: false,
+            no_session_persistence: false,
+            permission_prompt_tool_stdio: false,
+            include_partial_messages: false,
+        }
+    }
+
+    fn auth(args: Vec<String>) -> Self {
+        let json_events = args.iter().any(|arg| arg == "--json-events");
+        let login = args.get(1).map(String::as_str) == Some("login");
+        let passthrough_args = args
+            .into_iter()
+            .filter(|arg| arg != "--json-events")
+            .collect::<Vec<_>>();
+        let mode = if login && json_events {
+            CommandMode::AuthLoginJsonEvents
+        } else {
+            CommandMode::Passthrough
+        };
+        Self {
+            mode,
+            passthrough_args,
             prompt: None,
             input_format: InputFormat::Text,
             output_format: OutputFormat::Text,
@@ -664,6 +695,48 @@ mod tests {
                 .passthrough_args
                 .iter()
                 .any(|arg| arg == "--include-partial-messages")
+        );
+    }
+
+    #[test]
+    fn parse_auth_subcommands_passthrough() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "auth".to_owned(),
+            "status".to_owned(),
+            "--json".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(invocation.mode, CommandMode::Passthrough);
+        assert_eq!(
+            invocation.passthrough_args,
+            ["auth", "status", "--json"].map(str::to_owned)
+        );
+        assert_eq!(invocation.prompt, None);
+    }
+
+    #[test]
+    fn parse_auth_login_json_events_consumes_cctty_flag() {
+        let invocation = Invocation::parse(vec![
+            "cctty".to_owned(),
+            "auth".to_owned(),
+            "login".to_owned(),
+            "--json-events".to_owned(),
+            "--claudeai".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(invocation.mode, CommandMode::AuthLoginJsonEvents);
+        assert_eq!(
+            invocation.passthrough_args,
+            ["auth", "login", "--claudeai"].map(str::to_owned)
+        );
+        assert!(
+            !invocation
+                .passthrough_args
+                .iter()
+                .any(|arg| arg == "--json-events")
         );
     }
 

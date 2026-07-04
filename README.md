@@ -134,6 +134,30 @@ Claude binary:
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
 
+## Claude Code Auth Helper
+
+`cctty` can also wrap official Claude Code auth commands. Normal auth commands
+are passed through unchanged:
+
+```sh
+cctty auth status --json
+cctty auth logout
+cctty auth login --claudeai
+```
+
+For host apps that need to drive login from a UI, `auth login` supports a
+machine-readable event stream:
+
+```sh
+cctty auth login --json-events --claudeai
+```
+
+This launches the real `claude auth login` in a PTY, emits JSON lines for the
+authorization URL and code prompt, and forwards lines received on stdin back to
+Claude. The entered authorization code is not echoed in JSON events. `cctty`
+does not implement Claude's OAuth flow and does not store tokens; credentials
+are still managed by the official Claude Code CLI.
+
 ## Replacement Boundary
 
 `cctty` replaces the `claude` executable used by Claude Agent SDK apps and

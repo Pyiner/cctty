@@ -124,6 +124,27 @@ cctty --print --output-format stream-json "Reply exactly CCTTY_OK"
 CCTTY_CLAUDE_PATH=/path/to/claude cctty -p "Reply OK"
 ```
 
+## Claude Code 登录辅助
+
+`cctty` 也可以包装官方 Claude Code 登录命令。普通 auth 命令会原样透传：
+
+```sh
+cctty auth status --json
+cctty auth logout
+cctty auth login --claudeai
+```
+
+如果宿主应用需要在 UI 里驱动登录，可以使用机器可读事件流：
+
+```sh
+cctty auth login --json-events --claudeai
+```
+
+它会在 PTY 里启动真实的 `claude auth login`，用 JSON Lines 输出授权链接和
+code 输入请求，并把 stdin 收到的行继续写回 Claude。用户输入的授权 code 不会
+被输出到 JSON 事件里。`cctty` 不实现 Claude OAuth，也不保存 token；凭据仍由
+官方 Claude Code CLI 管理。
+
 ## SDK 接入
 
 绝大多数 SDK 应用只需要改一个路径。

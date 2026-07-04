@@ -47,6 +47,27 @@ impl PtyProcess {
             .unwrap_or_default()
     }
 
+    pub fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        if self.pid <= 0 {
+            return Ok(Some(0));
+        }
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
+        if result == 0 {
+            return Ok(None);
+        }
+        if result == self.pid {
+            self.pid = 0;
+            return Ok(Some(wait_status_code(status)));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            self.pid = 0;
+            return Ok(Some(0));
+        }
+        Err(error)
+    }
+
     pub fn kill(&mut self) {
         if self.pid <= 0 {
             return;
@@ -118,6 +139,16 @@ impl PtyProcess {
 impl Drop for PtyProcess {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+fn wait_status_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
     }
 }
 
