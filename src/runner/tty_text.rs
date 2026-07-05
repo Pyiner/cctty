@@ -2,7 +2,7 @@ pub(super) fn compact_tty_output(output: &str) -> String {
     output.split_whitespace().collect()
 }
 
-pub(super) fn plain_tty_output(output: &str) -> String {
+pub(crate) fn plain_tty_output(output: &str) -> String {
     let mut plain = String::with_capacity(output.len());
     let mut chars = output.chars().peekable();
     while let Some(ch) = chars.next() {

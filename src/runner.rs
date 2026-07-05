@@ -12,12 +12,13 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::args::{CommandMode, InputFormat, Invocation, OutputFormat};
+use crate::auth::{AuthLoginOptions, AuthLoginSession, auth_event_to_json};
 use crate::error::{CcttyError, Result};
 use crate::logging;
 use crate::pty::{PtyProcess, PtySpawnSpec};
 use crate::transcript::{TranscriptState, claude_config_dir, read_complete_lines, transcript_path};
 
-mod claude_path;
+pub(crate) mod claude_path;
 mod sdk_control;
 mod sdk_mcp;
 mod session_id;
@@ -31,9 +32,10 @@ use sdk_mcp::{
     sdk_mcp_runtime_servers, sdk_mcp_runtime_socket_path, sdk_mcp_servers_from_initialize,
 };
 use session_id::SessionIdAlias;
+pub(crate) use tty_text::plain_tty_output;
 use tty_text::{
-    compact_tty_output, plain_tty_output, recent_tty_log_text, single_line_log_text,
-    visible_tty_lines, visible_tty_lines_preserving_spacing,
+    compact_tty_output, recent_tty_log_text, single_line_log_text, visible_tty_lines,
+    visible_tty_lines_preserving_spacing,
 };
 
 const COMPLETION_IDLE: Duration = Duration::from_millis(1_500);
@@ -80,28 +82,21 @@ async fn run_passthrough(invocation: &Invocation) -> Result<i32> {
 }
 
 async fn run_auth_login_json_events(invocation: &Invocation) -> Result<i32> {
-    let claude = resolve_claude_path()?;
     let cwd = std::env::current_dir()?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let env = interactive_claude_env();
     logging::event(format!(
         "auth_login_json_events_spawn claude={} args={}",
-        claude,
+        "in-process",
         sanitized_arg_shape(&invocation.passthrough_args)
     ));
-    emit_json_event(json!({
-        "type": "started",
-        "command": claude,
-        "args": invocation.passthrough_args,
-    }))?;
-
-    let mut process = PtyProcess::spawn(&PtySpawnSpec {
-        command: claude,
-        args: invocation.passthrough_args.clone(),
-        cwd,
-        env,
-        unset_env: interactive_claude_unset_env(&invocation.passthrough_args),
+    let mut session = AuthLoginSession::start(AuthLoginOptions {
+        passthrough_args: invocation.passthrough_args.clone(),
+        claude_path: None,
+        cwd: Some(cwd),
+        timeout: RUN_TIMEOUT,
     })?;
+    let input = session.input();
+    let mut events = session.take_events();
     let (input_tx, input_rx) = std_mpsc::channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -115,102 +110,26 @@ async fn run_auth_login_json_events(invocation: &Invocation) -> Result<i32> {
         }
     });
 
-    let started = Instant::now();
-    let mut state = AuthLoginEventState::default();
     loop {
         while let Ok(line) = input_rx.try_recv() {
-            process.write_all(line.as_bytes())?;
-            process.write_all(b"\n")?;
+            input.submit_code(line).await?;
         }
 
-        process_auth_login_output(&process.recent_output(), &mut state)?;
-
-        if let Some(code) = process.try_wait()? {
-            process_auth_login_output(&process.recent_output(), &mut state)?;
-            if code != 0 {
-                emit_json_event(json!({
-                    "type": "error",
-                    "message": format!("Claude auth login exited with code {code}"),
-                }))?;
+        match tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+            Ok(Some(event)) => {
+                let is_exit = matches!(event, crate::auth::AuthLoginEvent::Exit { .. });
+                emit_json_event(auth_event_to_json(&event)?)?;
+                if is_exit {
+                    break;
+                }
             }
-            emit_json_event(json!({
-                "type": "exit",
-                "exit_code": code,
-            }))?;
-            logging::event(format!("auth_login_json_events_exit exit_code={code}"));
-            return Ok(code);
-        }
-
-        if started.elapsed() >= RUN_TIMEOUT {
-            process.terminate(PTY_TERMINATE_TIMEOUT);
-            emit_json_event(json!({
-                "type": "error",
-                "message": "Claude auth login timed out",
-            }))?;
-            emit_json_event(json!({
-                "type": "exit",
-                "exit_code": 124,
-            }))?;
-            logging::event("auth_login_json_events_timeout");
-            return Ok(124);
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[derive(Default)]
-struct AuthLoginEventState {
-    seen_urls: HashSet<String>,
-    input_requested: bool,
-    success: bool,
-}
-
-fn process_auth_login_output(output: &str, state: &mut AuthLoginEventState) -> Result<()> {
-    let plain = plain_tty_output(output);
-    for url in auth_login_urls(&plain) {
-        if state.seen_urls.insert(url.clone()) {
-            emit_json_event(json!({
-                "type": "authorization_url",
-                "url": url,
-            }))?;
+            Ok(None) => break,
+            Err(_) => {}
         }
     }
-    if !state.input_requested && plain.contains("Paste code here if prompted") {
-        state.input_requested = true;
-        emit_json_event(json!({
-            "type": "input_requested",
-            "input": "authorization_code",
-            "prompt": "Paste code here if prompted >",
-        }))?;
-    }
-    if !state.success && plain.contains("Login successful") {
-        state.success = true;
-        emit_json_event(json!({
-            "type": "success",
-            "message": "Login successful.",
-        }))?;
-    }
-    Ok(())
-}
-
-fn auth_login_urls(text: &str) -> Vec<String> {
-    let mut urls = Vec::new();
-    let mut rest = text;
-    while let Some(offset) = rest.find("https://") {
-        let candidate = &rest[offset..];
-        let end = candidate
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | ')' | ']'))
-            .unwrap_or(candidate.len());
-        let url = candidate[..end]
-            .trim_end_matches(|ch| matches!(ch, '.' | ',' | ';' | ':'))
-            .to_owned();
-        if !url.is_empty() {
-            urls.push(url);
-        }
-        rest = &candidate[end..];
-    }
-    urls
+    let code = session.wait().await?;
+    logging::event(format!("auth_login_json_events_exit exit_code={code}"));
+    Ok(code)
 }
 
 fn emit_json_event(value: Value) -> Result<()> {
@@ -376,14 +295,14 @@ fn spawn_tty_process(
     })
 }
 
-fn interactive_claude_env() -> HashMap<String, String> {
+pub(crate) fn interactive_claude_env() -> HashMap<String, String> {
     HashMap::from([
         ("TERM".to_owned(), "xterm-256color".to_owned()),
         ("COLORTERM".to_owned(), "truecolor".to_owned()),
     ])
 }
 
-fn interactive_claude_unset_env(args: &[String]) -> Vec<String> {
+pub(crate) fn interactive_claude_unset_env(args: &[String]) -> Vec<String> {
     let mut keys = [
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_AGENT_SDK_VERSION",

@@ -1,8 +1,9 @@
 mod args;
+pub mod auth;
 mod error;
 mod logging;
 mod pty;
-mod runner;
+pub(crate) mod runner;
 mod transcript;
 
 pub use error::{CcttyError, Result};

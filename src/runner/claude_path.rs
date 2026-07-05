@@ -4,13 +4,24 @@ use std::path::{Path, PathBuf};
 use crate::error::{CcttyError, Result};
 use crate::logging;
 
-pub(super) fn resolve_claude_path() -> Result<String> {
+pub(crate) fn resolve_claude_path() -> Result<String> {
+    resolve_claude_path_with_options(None, None)
+}
+
+pub(crate) fn resolve_claude_path_with_options(
+    current_dir: Option<&Path>,
+    explicit_path: Option<&Path>,
+) -> Result<String> {
     let own_exe = std::env::current_exe().ok();
-    let current_dir = std::env::current_dir().ok();
+    let default_current_dir = std::env::current_dir().ok();
+    let current_dir = current_dir.or(default_current_dir.as_deref());
+    let explicit_path = explicit_path
+        .map(|path| path.as_os_str().to_os_string())
+        .or_else(|| std::env::var_os("CCTTY_CLAUDE_PATH"));
     resolve_claude_path_from(
         own_exe.as_deref(),
-        current_dir.as_deref(),
-        std::env::var_os("CCTTY_CLAUDE_PATH"),
+        current_dir,
+        explicit_path,
         std::env::var_os("CONDUCTOR_AGENT_BINARIES_DIR"),
         std::env::var_os("PATH"),
     )
