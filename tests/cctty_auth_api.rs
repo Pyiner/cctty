@@ -1,6 +1,7 @@
 use cctty::auth::{
     AuthLoginEvent, AuthLoginOptions, AuthLoginSession, AuthStatusOptions, auth_status_json,
 };
+use std::collections::HashMap;
 
 mod support;
 use support::FakeClaude;
@@ -135,4 +136,78 @@ async fn auth_status_json_returns_parsed_claude_status() {
     assert_eq!(value["loggedIn"], true);
     assert_eq!(value["authMethod"], "claude.ai");
     assert_eq!(value["orgName"], "Test Org");
+}
+
+#[tokio::test]
+async fn auth_login_session_applies_per_session_environment() {
+    let fixture = FakeClaude::new();
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join("login-env.json");
+    let config_dir = dir.path().join("managed-claude");
+    let mut session = AuthLoginSession::start(AuthLoginOptions {
+        passthrough_args: ["auth", "login", "--claudeai"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        claude_path: Some(fixture.path().to_path_buf()),
+        env: HashMap::from([
+            (
+                "FAKE_CLAUDE_ENV_PATH".to_owned(),
+                env_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                config_dir.to_string_lossy().into_owned(),
+            ),
+        ]),
+        ..AuthLoginOptions::default()
+    })
+    .unwrap();
+    let input = session.input();
+    let mut events = session.take_events();
+    while let Some(event) = events.recv().await {
+        if matches!(event, AuthLoginEvent::AuthorizationUrl { .. }) {
+            input.submit_code("test-code#fake-state").await.unwrap();
+        }
+        if matches!(event, AuthLoginEvent::Exit { .. }) {
+            break;
+        }
+    }
+    assert_eq!(session.wait().await.unwrap(), 0);
+
+    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(env_path).unwrap()).unwrap();
+    assert_eq!(
+        env["CLAUDE_CONFIG_DIR"],
+        config_dir.to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn auth_status_json_applies_per_call_environment() {
+    let fixture = FakeClaude::new();
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join("status-env.json");
+    let config_dir = dir.path().join("managed-claude");
+    auth_status_json(AuthStatusOptions {
+        claude_path: Some(fixture.path().to_path_buf()),
+        env: HashMap::from([
+            (
+                "FAKE_CLAUDE_ENV_PATH".to_owned(),
+                env_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                config_dir.to_string_lossy().into_owned(),
+            ),
+        ]),
+        ..AuthStatusOptions::default()
+    })
+    .await
+    .unwrap();
+
+    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(env_path).unwrap()).unwrap();
+    assert_eq!(
+        env["CLAUDE_CONFIG_DIR"],
+        config_dir.to_string_lossy().as_ref()
+    );
 }

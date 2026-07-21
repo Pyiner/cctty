@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +26,12 @@ pub struct AuthLoginOptions {
     pub passthrough_args: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub claude_path: Option<PathBuf>,
+    /// Environment values applied only to this Claude auth process.
+    ///
+    /// Values override cctty's interactive defaults without mutating the
+    /// parent process environment, which keeps concurrent auth sessions
+    /// isolated from one another.
+    pub env: HashMap<String, String>,
     pub timeout: Duration,
 }
 
@@ -35,6 +41,7 @@ impl Default for AuthLoginOptions {
             passthrough_args: vec!["auth".to_owned(), "login".to_owned()],
             cwd: None,
             claude_path: None,
+            env: HashMap::new(),
             timeout: DEFAULT_AUTH_LOGIN_TIMEOUT,
         }
     }
@@ -44,6 +51,8 @@ impl Default for AuthLoginOptions {
 pub struct AuthStatusOptions {
     pub cwd: Option<PathBuf>,
     pub claude_path: Option<PathBuf>,
+    /// Environment values applied only to this Claude status process.
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,7 +80,8 @@ impl AuthLoginSession {
         };
         let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
         let claude = resolve_claude_path_with_options(Some(&cwd), options.claude_path.as_deref())?;
-        let env = interactive_claude_env();
+        let mut env = interactive_claude_env();
+        env.extend(options.env);
         logging::event(format!(
             "auth_login_session_spawn claude={} args={}",
             claude,
@@ -179,6 +189,7 @@ pub async fn auth_status_json(options: AuthStatusOptions) -> Result<Value> {
     let output = tokio::process::Command::new(claude)
         .args(["auth", "status", "--json"])
         .current_dir(cwd)
+        .envs(options.env)
         .output()
         .await?;
     if !output.status.success() {

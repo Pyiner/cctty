@@ -93,6 +93,7 @@ async fn run_auth_login_json_events(invocation: &Invocation) -> Result<i32> {
         passthrough_args: invocation.passthrough_args.clone(),
         claude_path: None,
         cwd: Some(cwd),
+        env: HashMap::new(),
         timeout: RUN_TIMEOUT,
     })?;
     let input = session.input();
