@@ -2,6 +2,7 @@ use cctty::auth::{
     AuthLoginEvent, AuthLoginOptions, AuthLoginSession, AuthStatusOptions, auth_status_json,
 };
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 mod support;
 use support::FakeClaude;
@@ -180,6 +181,100 @@ async fn auth_login_session_applies_per_session_environment() {
         env["CLAUDE_CONFIG_DIR"],
         config_dir.to_string_lossy().as_ref()
     );
+}
+
+#[tokio::test]
+async fn dropping_auth_login_session_reaps_child_process() {
+    let fixture = FakeClaude::new();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("auth-login.pid");
+    let mut session = AuthLoginSession::start(AuthLoginOptions {
+        passthrough_args: ["auth", "login", "--claudeai"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        claude_path: Some(fixture.path().to_path_buf()),
+        env: HashMap::from([(
+            "FAKE_CLAUDE_PID_PATH".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        )]),
+        ..AuthLoginOptions::default()
+    })
+    .unwrap();
+    let mut events = session.take_events();
+    while let Some(event) = events.recv().await {
+        if matches!(event, AuthLoginEvent::AuthorizationUrl { .. }) {
+            break;
+        }
+    }
+    let pid = std::fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    drop(events);
+    drop(session);
+
+    assert_child_reaped(pid).await;
+}
+
+#[tokio::test]
+async fn shutting_down_auth_login_session_reaps_child_process() {
+    let fixture = FakeClaude::new();
+    let dir = tempfile::tempdir().unwrap();
+    let pid_path = dir.path().join("auth-login.pid");
+    let mut session = AuthLoginSession::start(AuthLoginOptions {
+        passthrough_args: ["auth", "login", "--claudeai"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        claude_path: Some(fixture.path().to_path_buf()),
+        env: HashMap::from([(
+            "FAKE_CLAUDE_PID_PATH".to_owned(),
+            pid_path.to_string_lossy().into_owned(),
+        )]),
+        ..AuthLoginOptions::default()
+    })
+    .unwrap();
+    let mut events = session.take_events();
+    while let Some(event) = events.recv().await {
+        if matches!(event, AuthLoginEvent::AuthorizationUrl { .. }) {
+            break;
+        }
+    }
+    let pid = std::fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    session.shutdown().await.unwrap();
+
+    assert_child_reaped(pid).await;
+}
+
+async fn assert_child_reaped(pid: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let result = unsafe { libc::kill(pid, 0) };
+        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let mut status = 0;
+            let wait_result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if wait_result == 0 {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::waitpid(pid, &mut status, 0);
+                }
+            }
+            panic!("auth login child {pid} was not reaped; waitpid returned {wait_result}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

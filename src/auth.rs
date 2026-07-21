@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::{CcttyError, Result};
@@ -69,6 +69,7 @@ pub enum AuthLoginEvent {
 pub struct AuthLoginSession {
     input: AuthLoginInput,
     events: Option<mpsc::Receiver<AuthLoginEvent>>,
+    shutdown: Option<oneshot::Sender<()>>,
     join: Option<JoinHandle<Result<i32>>>,
 }
 
@@ -97,11 +98,13 @@ impl AuthLoginSession {
         })?;
         let (event_tx, event_rx) = mpsc::channel(64);
         let (input_tx, input_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let input = AuthLoginInput::new(input_tx);
         let join = tokio::spawn(run_auth_login_session(
             process,
             input_rx,
             event_tx,
+            shutdown_rx,
             claude,
             options.passthrough_args,
             options.timeout,
@@ -110,6 +113,7 @@ impl AuthLoginSession {
         Ok(Self {
             input,
             events: Some(event_rx),
+            shutdown: Some(shutdown_tx),
             join: Some(join),
         })
     }
@@ -129,10 +133,30 @@ impl AuthLoginSession {
             .join
             .take()
             .expect("auth login session completion already taken");
-        match join.await {
+        let result = match join.await {
             Ok(result) => result,
             Err(error) => Err(CcttyError::Tty(format!(
                 "Claude auth login task failed: {error}"
+            ))),
+        };
+        self.shutdown.take();
+        result
+    }
+
+    /// Stops the auth process and waits until its child process is reaped.
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.input.close();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let join = self
+            .join
+            .take()
+            .expect("auth login session completion already taken");
+        match join.await {
+            Ok(result) => result.map(|_| ()),
+            Err(error) => Err(CcttyError::Tty(format!(
+                "Claude auth login shutdown failed: {error}"
             ))),
         }
     }
@@ -141,9 +165,10 @@ impl AuthLoginSession {
 impl Drop for AuthLoginSession {
     fn drop(&mut self) {
         self.input.close();
-        if let Some(join) = self.join.take() {
-            join.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
         }
+        self.join.take();
     }
 }
 
@@ -209,61 +234,77 @@ async fn run_auth_login_session(
     mut process: PtyProcess,
     mut input_rx: mpsc::Receiver<String>,
     event_tx: mpsc::Sender<AuthLoginEvent>,
+    mut shutdown_rx: oneshot::Receiver<()>,
     claude: String,
     args: Vec<String>,
     timeout: Duration,
 ) -> Result<i32> {
-    send_auth_event(
-        &event_tx,
-        AuthLoginEvent::Started {
-            command: claude,
-            args,
-        },
-    )
-    .await?;
+    let result = async {
+        send_auth_event(
+            &event_tx,
+            AuthLoginEvent::Started {
+                command: claude,
+                args,
+            },
+        )
+        .await?;
 
-    let started = Instant::now();
-    let mut state = AuthLoginEventState::default();
-    loop {
-        while let Ok(line) = input_rx.try_recv() {
-            process.write_all(line.as_bytes())?;
-            process.write_all(b"\n")?;
-        }
+        let started = Instant::now();
+        let mut state = AuthLoginEventState::default();
+        loop {
+            while let Ok(line) = input_rx.try_recv() {
+                process.write_all(line.as_bytes())?;
+                process.write_all(b"\n")?;
+            }
 
-        process_auth_login_output(&process.recent_output(), &mut state, &event_tx).await?;
-
-        if let Some(code) = process.try_wait()? {
             process_auth_login_output(&process.recent_output(), &mut state, &event_tx).await?;
-            if code != 0 {
+
+            if let Some(code) = process.try_wait()? {
+                process_auth_login_output(&process.recent_output(), &mut state, &event_tx).await?;
+                if code != 0 {
+                    send_auth_event(
+                        &event_tx,
+                        AuthLoginEvent::Error {
+                            message: format!("Claude auth login exited with code {code}"),
+                        },
+                    )
+                    .await?;
+                }
+                send_auth_event(&event_tx, AuthLoginEvent::Exit { exit_code: code }).await?;
+                logging::event(format!("auth_login_session_exit exit_code={code}"));
+                break Ok(code);
+            }
+
+            if started.elapsed() >= timeout {
+                process.terminate(PTY_TERMINATE_TIMEOUT);
                 send_auth_event(
                     &event_tx,
                     AuthLoginEvent::Error {
-                        message: format!("Claude auth login exited with code {code}"),
+                        message: "Claude auth login timed out".to_owned(),
                     },
                 )
                 .await?;
+                send_auth_event(&event_tx, AuthLoginEvent::Exit { exit_code: 124 }).await?;
+                logging::event("auth_login_session_timeout");
+                break Ok(124);
             }
-            send_auth_event(&event_tx, AuthLoginEvent::Exit { exit_code: code }).await?;
-            logging::event(format!("auth_login_session_exit exit_code={code}"));
-            return Ok(code);
-        }
 
-        if started.elapsed() >= timeout {
-            process.terminate(PTY_TERMINATE_TIMEOUT);
-            send_auth_event(
-                &event_tx,
-                AuthLoginEvent::Error {
-                    message: "Claude auth login timed out".to_owned(),
-                },
-            )
-            .await?;
-            send_auth_event(&event_tx, AuthLoginEvent::Exit { exit_code: 124 }).await?;
-            logging::event("auth_login_session_timeout");
-            return Ok(124);
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    process.terminate(PTY_TERMINATE_TIMEOUT);
+                    logging::event("auth_login_session_shutdown");
+                    break Ok(130);
+                }
+                _ = tokio::time::sleep(AUTH_LOGIN_POLL) => {}
+            }
         }
-
-        tokio::time::sleep(AUTH_LOGIN_POLL).await;
     }
+    .await;
+
+    if result.is_err() {
+        process.terminate(PTY_TERMINATE_TIMEOUT);
+    }
+    result
 }
 
 async fn send_auth_event(

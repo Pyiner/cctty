@@ -37,6 +37,10 @@ import termios
 import time
 import tty
 
+pid_path = os.environ.get("FAKE_CLAUDE_PID_PATH")
+if pid_path:
+    Path(pid_path).write_text(str(os.getpid()), encoding="utf-8")
+
 argv_path = os.environ.get("FAKE_CLAUDE_ARGV_PATH")
 if argv_path:
     Path(argv_path).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
